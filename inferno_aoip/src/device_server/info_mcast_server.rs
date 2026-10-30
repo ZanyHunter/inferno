@@ -163,7 +163,12 @@ impl<'s> Multicaster<'s> {
       .get_overlay()
       .as_ref()
       .map(|clkovl| {
-        let freq_offset_f = (clkovl.freq_scale_including_hw() * 1_000_000_000f64).round();
+        // freq_scale_including_hw() exists only in the Linux build of usrvclock (clock_adjtime).
+        #[cfg(target_os = "linux")]
+        let freq_scale = clkovl.freq_scale_including_hw();
+        #[cfg(not(target_os = "linux"))]
+        let freq_scale = clkovl.freq_scale;
+        let freq_offset_f = (freq_scale * 1_000_000_000f64).round();
         if i32::MIN as f64 <= freq_offset_f && freq_offset_f <= i32::MAX as f64 {
           Some(freq_offset_f as i32)
         } else {

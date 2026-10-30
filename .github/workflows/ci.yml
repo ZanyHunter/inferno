@@ -1,0 +1,41 @@
+name: CI
+
+# ONS fork CI. Upstream has none. See FORK.md.
+on:
+  push:
+    branches: [dev, windows-support]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      # The submodules (searchfire, usrvclock-rs, alsa-sys-all) live on GitLab and are pinned by commit.
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      # alsa_pcm_inferno / alsa-sys-all are Linux only and are not in default-members.
+      - run: cargo build -p inferno_aoip -p inferno2pipe --target x86_64-pc-windows-msvc
+      - run: cargo test -p inferno_aoip -p inferno2pipe -p ons-usrvclock --target x86_64-pc-windows-msvc
+      # searchfire's client_and_server integration test needs real mDNS and is skipped on Windows (FORK.md).
+      - run: cargo test -p searchfire --lib --target x86_64-pc-windows-msvc
+
+  # Regression guard for the Unix path (real usrvclock, loopback_trx test). Does not need libasound:
+  # alsa_pcm_inferno is not built.
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p inferno_aoip -p inferno2pipe
+      - run: cargo test -p inferno_aoip -p inferno2pipe -p ons-usrvclock

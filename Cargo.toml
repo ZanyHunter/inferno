@@ -6,6 +6,18 @@ members = [
     "searchfire",
     "inferno2pipe",
     "alsa_pcm_inferno",
+    "ons-usrvclock",
+]
+
+# ONS fork: alsa_pcm_inferno (and its alsa-sys-all submodule) only build on Linux with libasound.
+# Leaving them out of default-members keeps a plain `cargo build/test` working on Windows.
+# Linux builds of the plugin use `cargo build -p alsa_pcm_inferno` as before.
+# searchfire is built as a dependency but not tested by default: its client_and_server integration
+# test needs real mDNS on UDP 5353 and times out on Windows (see FORK.md).
+default-members = [
+    "inferno_aoip",
+    "inferno2pipe",
+    "ons-usrvclock",
 ]
 
 [workspace.metadata.cross.target.aarch64-unknown-linux-gnu]

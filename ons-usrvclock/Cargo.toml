@@ -1,0 +1,19 @@
+# ONS fork facade for usrvclock (ZanyHunter/open-network-soundcard#94, W3). See FORK.md. Not in upstream Inferno.
+#
+# Cargo requires one source path per dependency regardless of target, so inferno_aoip depends on this
+# facade (renamed to `usrvclock`). On Unix it re-exports the real upstream crate unchanged. On other
+# targets (Windows) it provides a TEMPORARY shim, to be replaced by a real in-process clock in W2
+# (ZanyHunter/open-network-soundcard#88).
+[package]
+name = "ons-usrvclock"
+version = "0.0.1"
+edition = "2021"
+description = "Facade: upstream usrvclock on Unix, temporary shim elsewhere"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+tokio = { version = "1.38.1", features = ["sync"] }
+
+[target.'cfg(unix)'.dependencies]
+upstream-usrvclock = { package = "usrvclock", path = "../usrvclock-rs" }
