@@ -589,6 +589,9 @@ impl FlowsTransmitter {
         };
 
         let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(self.self_info.ip_address), 0))?;
+        // W6: this socket sends multicast flows too; pick the egress NIC and size the buffers.
+        crate::util::sockopts::apply_multicast_egress_platform(&socket, self.self_info.ip_address);
+        crate::util::sockopts::apply_audio_buffers_platform(&socket, false, true);
         socket.connect(dst_addr)?;
         socket.set_nonblocking(true)?;
         //socket.set_read_timeout(Some(Duration::from_micros(1)))?;
