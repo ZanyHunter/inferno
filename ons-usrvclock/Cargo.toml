@@ -1,14 +1,17 @@
-# ONS fork facade for usrvclock (ZanyHunter/open-network-soundcard#94, W3). See FORK.md. Not in upstream Inferno.
+# ONS fork facade for usrvclock (ZanyHunter/open-network-soundcard#88, W2). See FORK.md. Not in upstream Inferno.
 #
-# Cargo requires one source path per dependency regardless of target, so inferno_aoip depends on this
-# facade (renamed to `usrvclock`). On Unix it re-exports the real upstream crate unchanged. On other
-# targets (Windows) it provides a TEMPORARY shim, to be replaced by a real in-process clock in W2
-# (ZanyHunter/open-network-soundcard#88).
+# Two parts:
+#  * `ClockOverlay` (the clock model Inferno consumes): on Unix the real upstream `usrvclock` type,
+#    re-exported unchanged; elsewhere (Windows) a same-shaped type whose underlying clock is
+#    QueryPerformanceCounter. Cargo needs one source path per dependency regardless of target, so
+#    inferno_aoip depends on this facade (renamed to `usrvclock`).
+#  * `ClockPublisher` (all platforms): the in-process clock source. The host application publishes
+#    overlays into it; no sockets, no IPC.
 [package]
 name = "ons-usrvclock"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
-description = "Facade: upstream usrvclock on Unix, temporary shim elsewhere"
+description = "Facade: ClockOverlay (upstream usrvclock on Unix, QPC-backed on Windows) plus an in-process ClockPublisher"
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -17,3 +20,9 @@ tokio = { version = "1.38.1", features = ["sync"] }
 
 [target.'cfg(unix)'.dependencies]
 upstream-usrvclock = { package = "usrvclock", path = "../usrvclock-rs" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Performance"] }
+
+[dev-dependencies]
+tokio = { version = "1.38.1", features = ["sync", "rt", "macros", "time"] }

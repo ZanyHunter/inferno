@@ -41,7 +41,7 @@ pub(crate) mod settings;
 pub(crate) mod tx_multicasts;
 
 pub use crate::common::{Clock, ClockDiff, Sample};
-pub use crate::media_clock::{MediaClock, RealTimeClockReceiver};
+pub use crate::media_clock::{ClockOverlay, ClockPublisher, MediaClock, RealTimeClockReceiver};
 pub use crate::ring_buffer::{new_owned, ExternalBufferParameters, PositionReportDestination, RBInput};
 pub use settings::Settings;
 pub type AtomicSample = atomic::Atomic<Sample>;
@@ -82,7 +82,17 @@ pub struct DeviceServer {
 }
 
 impl DeviceServer {
+  /// Starts the device with the clock taken from `settings.clock_path` (usrvclock socket, Unix only).
+  /// On platforms without that transport use [`DeviceServer::start_with_clock`].
   pub async fn start(settings: settings::Settings) -> Self {
+    Self::start_with_clock(settings, None).await
+  }
+
+  /// Starts the device. With `Some(clock)`, the media clock comes from that in-process
+  /// [`ClockPublisher`]: the host publishes [`ClockOverlay`]s into it (ONS: converted from the ons-ptp
+  /// media clock), on every platform and with no socket. With `None` it behaves like
+  /// [`DeviceServer::start`].
+  pub async fn start_with_clock(settings: settings::Settings, clock: Option<ClockPublisher>) -> Self {
     let self_info = Arc::new(settings.self_info);
     let state_storage = Arc::new(StateStorage::new(&self_info));
     let ref_instant = Instant::now();
@@ -99,8 +109,12 @@ impl DeviceServer {
     let mdns_client = Arc::new(crate::mdns_client::MdnsClient::new(self_info.clone()));
     let (mcast_tx, mcast_rx) = mpsc::channel(100);
 
-    info!("clock path: {:?}", settings.clock_path);
-    let clock_receiver = start_clock_receiver(settings.clock_path.clone());
+    if clock.is_some() {
+      info!("clock source: in-process publisher");
+    } else {
+      info!("clock path: {:?}", settings.clock_path);
+    }
+    let clock_receiver = start_clock_receiver(settings.clock_path.clone(), clock);
 
     info!("waiting for clock");
     let shared_media_clock = make_shared_media_clock(&clock_receiver, settings.use_safe_clock).await;
@@ -407,7 +421,7 @@ impl DeviceServer {
       todo.await;
     }
     self.shutdown_todo.await;
-    self.clock_receiver.stop().await.unwrap();
+    self.clock_receiver.stop().await;
     info!("shutdown ok");
   }
 }

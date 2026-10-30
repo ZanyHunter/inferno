@@ -16,7 +16,7 @@ ONS is not affiliated with Audinate. This fork contains no Audinate code, SDKs o
   README, `LICENSE*` files and `authors` fields as they are. New files that are ours state their licence in
   the header or manifest.
 * The submodules keep their own licences: `searchfire` and `usrvclock-rs` are MIT OR Apache-2.0.
-* New code in `ons-usrvclock/` is MIT OR Apache-2.0 (it is part of the usrvclock replacement, a compatible
+* New code in `ons-usrvclock/` is MIT OR Apache-2.0 (it is the in-process clock source, a compatible
   licence for a library GPL code links against).
 
 ## Branches
@@ -73,8 +73,9 @@ submodule must still be checked out because Cargo reads every path dependency's 
 | CI | `.github/workflows/ci.yml`: Windows (`windows-latest`) build and test, plus a Linux regression job. | ONS #87 |
 | `inferno_aoip/src/util/os.rs` | Fix the never-compiled `cfg(not(unix))` branch: missing `ThreadPriority` import, `u32` vs `u8`. Behaviour is still only `ThreadPriority::Max`. MMCSS and time-critical priority are ONS #28. | ONS #94 (W3) |
 | `inferno_aoip/src/device_server/info_mcast_server.rs` | `freq_scale_including_hw()` is Linux only (`clock_adjtime`); other targets use `freq_scale`. | ONS #94 (W3) |
-| `inferno_aoip/tests/loopback_trx.rs` | Gated `#![cfg(unix)]` (needs `usrvclock::Server`). To be ported in W2. | ONS #88 (W2) |
-| `ons-usrvclock/` | **TEMPORARY.** Facade crate that `inferno_aoip` now depends on (as `usrvclock`). Unix: re-exports the real upstream `usrvclock` unchanged. Windows: `windows_shim.rs`, a minimal stand-in (`ClockOverlay` math with `Instant`/QPC as the underlying clock, an `AsyncClient` that is only a `watch` channel with a `publish()` method, empty `SafeClock`). It exists so `inferno_aoip` compiles; **no overlay ever arrives** unless the owner calls `publish`. | Replaced by ONS #88 (W2) |
+| `inferno_aoip/tests/loopback_trx.rs` | Uses an in-process `ClockPublisher` instead of a `usrvclock::Server`, so it runs on Windows and Unix alike (no `cfg(unix)` gate). | ONS #88 (W2) |
+| `inferno_aoip/src/media_clock.rs`, `device_server/mod.rs` | `ClockReceiver` is now an inferno_aoip type with two sources: an in-process `ClockPublisher` (all platforms, preferred) or the usrvclock socket (Unix only, upstream behaviour). New `DeviceServer::start_with_clock(settings, Option<ClockPublisher>)`; `DeviceServer::start` is unchanged for callers (Unix socket via `CLOCK_PATH`). `ClockOverlay` and `ClockPublisher` are exported from `device_server`. On a non-Unix target without a publisher the clock never becomes ready (logged as an error). | ONS #88 (W2) |
+| `ons-usrvclock/` | Facade crate that `inferno_aoip` depends on (as `usrvclock`). `ClockOverlay`: on Unix the real upstream `usrvclock` type re-exported unchanged; on Windows a same-shaped type (same math) whose underlying clock is QueryPerformanceCounter in absolute ns (`ticks * 1e9 / freq`, floor), so a host converting its own QPC ticks lands on the same scale. `ClockPublisher` (all platforms): the in-process clock source, a cloneable handle on a `tokio::sync::watch` channel. The host calls `publish(ClockOverlay)` from any thread and Inferno's consumers (media clock, flows, info_mcast_server) read it. There is no `usrvclock` dependency on Windows. The crate name is historical. ONS feeds it from the `ons-ptp` MediaClock (`ons-dante`, feature `inferno`). | ONS #88 (W2) |
 
 Known test gap: `searchfire`'s `client_and_server` integration test (real mDNS on UDP 5353) times out on
 Windows (30 s). It is a submodule test and is not run in CI. Behaviour of mDNS next to the Windows DNS
