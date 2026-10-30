@@ -2,9 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
 
-pub use usrvclock::AsyncClient as ClockReceiver;
 pub use usrvclock::ClockOverlay;
-use usrvclock::SafeClock;
+pub use usrvclock::ClockPublisher;
 
 use crate::common::*;
 use crate::util::real_time_box_channel::{self, RealTimeBoxReceiver};
@@ -98,11 +97,69 @@ impl MediaClock {
   }
 }
 
-pub fn start_clock_receiver(path: Option<PathBuf>) -> ClockReceiver {
-  ClockReceiver::start(
-    path.unwrap_or(usrvclock::DEFAULT_SERVER_SOCKET_PATH.into()),
-    Box::new(|e| warn!("clock receive error: {e:?}")),
-  )
+/// Where Inferno gets its media clock from.
+///
+/// ONS fork: the transport is chosen at start-up.
+/// * In-process (all platforms): the host application owns a [`ClockPublisher`] and publishes
+///   [`ClockOverlay`]s into it. No sockets involved.
+/// * usrvclock socket (Unix only, upstream behaviour): overlays arrive from an external clock server
+///   such as Statime, at the socket path from the settings.
+pub struct ClockReceiver {
+  source: ClockSource,
+}
+
+enum ClockSource {
+  InProcess(ClockPublisher),
+  #[cfg(unix)]
+  Socket(usrvclock::AsyncClient),
+}
+
+impl ClockReceiver {
+  /// Subscribes to overlay changes.
+  pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Option<ClockOverlay>> {
+    match &self.source {
+      ClockSource::InProcess(publisher) => publisher.subscribe(),
+      #[cfg(unix)]
+      ClockSource::Socket(client) => client.subscribe(),
+    }
+  }
+
+  /// Stops receiving. The host keeps ownership of an in-process [`ClockPublisher`].
+  pub async fn stop(self) {
+    match self.source {
+      ClockSource::InProcess(_) => {}
+      #[cfg(unix)]
+      ClockSource::Socket(client) => {
+        let _ = client.stop().await;
+      }
+    }
+  }
+}
+
+/// Starts the clock receiver. `publisher` (the in-process source) wins over `path` (usrvclock socket).
+/// Without a publisher, Unix falls back to the usrvclock socket; other platforms have no socket
+/// transport, so they get an empty publisher and the clock never becomes ready (logged as an error).
+pub fn start_clock_receiver(path: Option<PathBuf>, publisher: Option<ClockPublisher>) -> ClockReceiver {
+  if let Some(publisher) = publisher {
+    return ClockReceiver { source: ClockSource::InProcess(publisher) };
+  }
+  #[cfg(unix)]
+  {
+    ClockReceiver {
+      source: ClockSource::Socket(usrvclock::AsyncClient::start(
+        path.unwrap_or(usrvclock::DEFAULT_SERVER_SOCKET_PATH.into()),
+        Box::new(|e| warn!("clock receive error: {e:?}")),
+      )),
+    }
+  }
+  #[cfg(not(unix))]
+  {
+    let _ = path;
+    error!(
+      "no in-process clock source given and this platform has no usrvclock socket: the media clock will never become ready"
+    );
+    ClockReceiver { source: ClockSource::InProcess(ClockPublisher::new()) }
+  }
 }
 
 pub async fn make_shared_media_clock(

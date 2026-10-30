@@ -4,12 +4,8 @@
 //! - TX device transmits a deterministic ramp pattern on 2 channels
 //! - RX device receives and verifies the exact payload
 //!
-//! A fake usrvclock server provides the media clock.
-//!
-//! ONS fork: Unix only until the usrvclock replacement (W2) lands, because `usrvclock::Server`
-//! uses Unix datagram sockets.
-
-#![cfg(unix)]
+//! An in-process `ClockPublisher` provides the media clock (ONS fork, W2: no usrvclock socket, so
+//! this test runs on Windows as well as Unix).
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -20,7 +16,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use inferno_aoip::device_server::{
-  AtomicSample, DeviceServer, ExternalBufferParameters, MediaClock, Sample, Settings, TransferNotifier,
+  AtomicSample, ClockOverlay, ClockPublisher, DeviceServer, ExternalBufferParameters, MediaClock, Sample,
+  Settings, TransferNotifier,
 };
 
 const BUF_SIZE: usize = 65536;
@@ -32,7 +29,6 @@ fn make_settings(
   alt_port: u16,
   rx_channels: usize,
   tx_channels: usize,
-  clock_path: &str,
 ) -> Settings {
   let mut config = BTreeMap::new();
   config.insert("NAME".to_string(), name.to_string());
@@ -41,7 +37,6 @@ fn make_settings(
   config.insert("RX_CHANNELS".to_string(), rx_channels.to_string());
   config.insert("TX_CHANNELS".to_string(), tx_channels.to_string());
   config.insert("SAMPLE_RATE".to_string(), SAMPLE_RATE.to_string());
-  config.insert("CLOCK_PATH".to_string(), clock_path.to_string());
   config.insert("BIND_IP".to_string(), "127.0.0.1".to_string());
 
   let mut settings = Settings::new(name, name, Some(Ipv4Addr::new(127, 0, 0, 1)), &config);
@@ -50,21 +45,25 @@ fn make_settings(
   settings
 }
 
-fn start_clock_server(path: &str, running: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
-  let path = path.to_string();
-  std::thread::spawn(move || {
-    let mut server = usrvclock::Server::new(path.into()).unwrap();
-    let overlay = usrvclock::ClockOverlay {
+/// Identity overlay on the platform's underlying clock: CLOCK_MONOTONIC on Unix (`clock_id` 1), QPC on
+/// Windows (`clock_id` is ignored there).
+fn start_clock_publisher(running: Arc<AtomicBool>) -> (ClockPublisher, std::thread::JoinHandle<()>) {
+  let publisher = ClockPublisher::new();
+  let thread_publisher = publisher.clone();
+  let handle = std::thread::spawn(move || {
+    let overlay = ClockOverlay {
       clock_id: 1i64, // CLOCK_MONOTONIC
       last_sync: 0,
       shift: 0,
       freq_scale: 0.0,
     };
+    // Republish periodically, like a servo would.
     while running.load(Ordering::Relaxed) {
-      server.send(overlay);
+      thread_publisher.publish(overlay);
       std::thread::sleep(Duration::from_millis(100));
     }
-  })
+  });
+  (publisher, handle)
 }
 
 async fn wait_for_clock(
@@ -122,18 +121,15 @@ fn find_samples_offset(a: &[AtomicSample], b: &[Sample]) -> Option<usize> {
 async fn test_loopback_trx() {
   let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).try_init();
 
-  let clock_path = "/tmp/inferno-test-usrvclock";
-  let _ = std::fs::remove_file(clock_path);
-
   let clock_running = Arc::new(AtomicBool::new(true));
-  let clock_thread = start_clock_server(clock_path, clock_running.clone());
+  let (clock, clock_thread) = start_clock_publisher(clock_running.clone());
   tokio::time::sleep(Duration::from_millis(300)).await;
 
-  let tx_settings = make_settings("test_tx", 1, 9000, 0, 2, clock_path);
-  let rx_settings = make_settings("test_rx", 2, 9100, 2, 0, clock_path);
+  let tx_settings = make_settings("test_tx", 1, 9000, 0, 2);
+  let rx_settings = make_settings("test_rx", 2, 9100, 2, 0);
 
-  let mut tx_server = DeviceServer::start(tx_settings).await;
-  let mut rx_server = DeviceServer::start(rx_settings).await;
+  let mut tx_server = DeviceServer::start_with_clock(tx_settings, Some(clock.clone())).await;
+  let mut rx_server = DeviceServer::start_with_clock(rx_settings, Some(clock)).await;
 
   let tx_hostname = tx_server.self_info.friendly_hostname.clone();
 
@@ -253,7 +249,6 @@ async fn test_loopback_trx() {
   tx_server.shutdown().await;
   clock_running.store(false, Ordering::Relaxed);
   let _ = clock_thread.join();
-  let _ = std::fs::remove_file(clock_path);
 
   atomic::fence(Ordering::SeqCst);
 

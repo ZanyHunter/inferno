@@ -33,7 +33,8 @@ atomicbox = "0.4.0"
 mio = { version = "1.0.2", features = ["net", "os-ext", "os-poll"] }
 bool_vec = "0.2.1"
 bytemuck = "1.17.1"
-# ONS fork: facade crate. Real usrvclock on Unix, TEMPORARY shim on Windows (see FORK.md, issue W2).
+# ONS fork: facade crate. ClockOverlay (upstream usrvclock on Unix, QPC-backed on Windows) plus the in-process
+# ClockPublisher. No usrvclock/nix dependency on Windows (see FORK.md, issue W2).
 usrvclock = { package = "ons-usrvclock", path = "../ons-usrvclock" }
 arrayvec = "0.7.6"
 netdev = "0.32.0"
