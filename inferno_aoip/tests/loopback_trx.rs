@@ -5,6 +5,11 @@
 //! - RX device receives and verifies the exact payload
 //!
 //! A fake usrvclock server provides the media clock.
+//!
+//! ONS fork: Unix only until the usrvclock replacement (W2) lands, because `usrvclock::Server`
+//! uses Unix datagram sockets.
+
+#![cfg(unix)]
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
