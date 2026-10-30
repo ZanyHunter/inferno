@@ -1,5 +1,7 @@
 # Inferno - unofficial implementation of Dante protocol
 
+> **Fork notice:** this is the ZanyHunter fork used by [Open Network Soundcard](https://github.com/ZanyHunter/open-network-soundcard) (Windows support). See [FORK.md](FORK.md) for what differs from upstream. All credit for Inferno belongs to its upstream authors.
+
 [GitLab](https://gitlab.com/lumifaza/inferno) | [GitHub](https://github.com/teodly/inferno) | [Principal author's website](https://info.lumifaza.org/)
 
 This project is named after [a place](https://en.wikipedia.org/wiki/Inferno_(Dante)) destined for those who create undocumented network protocols.
