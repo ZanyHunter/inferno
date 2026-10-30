@@ -43,7 +43,10 @@ pub(crate) mod tx_multicasts;
 pub use crate::common::{Clock, ClockDiff, Sample};
 pub use crate::media_clock::{ClockOverlay, ClockPublisher, MediaClock, RealTimeClockReceiver};
 pub use crate::ring_buffer::{new_owned, ExternalBufferParameters, PositionReportDestination, RBInput};
-pub use settings::Settings;
+pub use settings::{
+  default_state_dir, program_data_state_dir, sanitize_device_name, validate_device_name, NicInfo, NicSelector,
+  Settings, SettingsBuilder, SettingsError, MAX_DEVICE_NAME_LEN,
+};
 pub type AtomicSample = atomic::Atomic<Sample>;
 
 use channels_subscriber::{ChannelsBuffering, ChannelsSubscriber, ExternalBuffering, OwnedBuffering};
@@ -94,7 +97,7 @@ impl DeviceServer {
   /// [`DeviceServer::start`].
   pub async fn start_with_clock(settings: settings::Settings, clock: Option<ClockPublisher>) -> Self {
     let self_info = Arc::new(settings.self_info);
-    let state_storage = Arc::new(StateStorage::new(&self_info));
+    let state_storage = Arc::new(StateStorage::new(&self_info, &settings.state_dir));
     let ref_instant = Instant::now();
 
     let (shutdown_send, shdn_recv1) = broadcast_queue::channel(16);

@@ -232,6 +232,7 @@ Configuration can be set via:
 All settings have default values. In a simple setup you should be able to start without specifying any parameters.
 * `BIND_IP` - which local IP to bind to. Specifying it may be necessary if you have multiple network interfaces. Alternatively, network interface name may be specified, in that case the first address belonging to the interface will be used.
 * `DEVICE_ID` - 16 hexadecimal digits (8 bytes) used as a device ID. Dante devices usually use MAC address padded with zeros. Inferno uses `0000<IP address>0000` by default. Device ID is the storage key when saving state.
+* `STATE_DIR` - (ONS fork) directory for persistent state; Inferno creates one sub-folder per device ID in it. Defaults to `~/.local/state/inferno_aoip` on Linux and to `%ProgramData%\OpenNetworkSoundcard` on Windows.
 * `NAME` - name of advertised device. If unspecified, name based on app name and IP address will be generated. May be removed in future versions when it becomes settable from DC and so stored in a configuration file.
 * `SAMPLE_RATE` - sample rate this device will operate on
 * `PROCESS_ID` - integer number between 0 and 65535. Must be provided and unique when starting multiple instances on a single IP address. Specifying different `DEVICE_ID`s is not sufficient.
