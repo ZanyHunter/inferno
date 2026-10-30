@@ -43,6 +43,9 @@ fn make_settings(
   config.insert("SAMPLE_RATE".to_string(), SAMPLE_RATE.to_string());
   config.insert("CLOCK_PATH".to_string(), clock_path.to_string());
   config.insert("BIND_IP".to_string(), "127.0.0.1".to_string());
+  // Never write test state into the real state directory.
+  let state_dir = std::env::temp_dir().join(format!("inferno_loopback_{name}"));
+  config.insert("STATE_DIR".to_string(), state_dir.to_string_lossy().into_owned());
 
   let mut settings = Settings::new(name, name, Some(Ipv4Addr::new(127, 0, 0, 1)), &config);
   settings.make_rx_channels(rx_channels);

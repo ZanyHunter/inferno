@@ -75,6 +75,23 @@ submodule must still be checked out because Cargo reads every path dependency's 
 | `inferno_aoip/src/device_server/info_mcast_server.rs` | `freq_scale_including_hw()` is Linux only (`clock_adjtime`); other targets use `freq_scale`. | ONS #94 (W3) |
 | `inferno_aoip/tests/loopback_trx.rs` | Gated `#![cfg(unix)]` (needs `usrvclock::Server`). To be ported in W2. | ONS #88 (W2) |
 | `ons-usrvclock/` | **TEMPORARY.** Facade crate that `inferno_aoip` now depends on (as `usrvclock`). Unix: re-exports the real upstream `usrvclock` unchanged. Windows: `windows_shim.rs`, a minimal stand-in (`ClockOverlay` math with `Instant`/QPC as the underlying clock, an `AsyncClient` that is only a `watch` channel with a `publish()` method, empty `SafeClock`). It exists so `inferno_aoip` compiles; **no overlay ever arrives** unless the owner calls `publish`. | Replaced by ONS #88 (W2) |
+| `inferno_aoip/src/device_server/settings.rs` | **Typed `SettingsBuilder`** (`Settings::builder`) returning `Result<_, SettingsError>`: NIC chosen by `NicSelector` (GUID, IPv4, friendly name, auto) or a pre-resolved `NicInfo`; device ID set explicitly or from the NIC MAC (`mac[0..6] ++ process_id BE`, so `mac ++ 00 00` by default; **verify** against a hardware device); device name checked against the Dante name rules (1 to 31 chars of `[A-Za-z0-9-]`, no leading/trailing `-`; **verify**); ports, latencies, channel counts, sample rate and bit depth range-checked. `Settings::try_new` is the fallible form of the upstream env-var/`BTreeMap` path (`INFERNO_*` variables still work, plus the new `STATE_DIR`); `Settings::new` keeps its signature and only panics there, with the error message. Names from the env path are not validated (only cut to 31 chars on a char boundary) and the historic default name `<app> <hex ip>` is kept. The old startup `unwrap`/`expect` calls are gone; the full robustness pass is W9. | ONS #89 (W4) |
+| `inferno_aoip/src/state_storage.rs`, `Settings::state_dir` | **Injectable state dir.** `StateStorage::new(&self_info, &settings.state_dir)`; no more `platform_dirs` `unwrap()`. Default: `%ProgramData%\OpenNetworkSoundcard` on Windows (`default_state_dir`), the upstream `platform_dirs` path elsewhere. Files are `<state_dir>/<device id hex>/{rx,tx}_channels.toml` etc. Tests use temp dirs only. | ONS #90 (W5) |
+
+### State file format decision (W5): keep TOML
+
+Channel names and RX subscriptions stay in **per-item TOML files** (`rx_channels.toml`, `tx_channels.toml`, ...)
+inside a per-device-ID folder, written with write-temp-then-rename. We do not move to the single `state.json`
+that ONS ADR-006 originally sketched, because:
+
+* the engine already reads and writes TOML, with tests; a JSON switch would be churn in code we want to keep
+  mergeable with upstream, for no functional gain;
+* TOML is human-editable, which helps support, and `ons-common` already uses TOML for `config.toml`;
+* per-item files keep one corrupt file from losing everything (a bad `rx_channels.toml` only resets names).
+
+The device *name* is not persisted by the engine; the host owns it (`device_name` in ONS `config.toml`) and
+passes it through `SettingsBuilder::device_name`. ONS passes the root of `%ProgramData%\OpenNetworkSoundcard`
+as the state dir, so Inferno's device-ID folder sits beside `config.toml` and `logs\`.
 
 Known test gap: `searchfire`'s `client_and_server` integration test (real mDNS on UDP 5353) times out on
 Windows (30 s). It is a submodule test and is not run in CI. Behaviour of mDNS next to the Windows DNS
