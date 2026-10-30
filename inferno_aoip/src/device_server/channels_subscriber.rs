@@ -774,20 +774,24 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
       // Create flows for multicast receivers:
       // TODO make DC display warning when removing multicast flow from the transmitter
       for (bundle_full_name, advbundle) in &bundles {
-        let socket = match mio::net::UdpSocket::bind(advbundle.media_addr) {
-          Ok(socket) => socket,
-          Err(e) => {
-            error!("failed to bind to socket {:?} for multicast media: {e:?}", advbundle.media_addr);
-            continue;
-          }
-        };
-        let mcast_ipv4 = match advbundle.media_addr.ip() {
-          std::net::IpAddr::V4(ip) => ip,
+        let media_addr_v4 = match advbundle.media_addr {
+          SocketAddr::V4(a) => a,
           _ => panic!("media multicast address is not ipv4"),
         };
-        if let Err(e) = socket.join_multicast_v4(&mcast_ipv4, &self.self_info.ip_address) {
-          error!("failed to join multicast group {:?}: {e:?}", advbundle.media_addr.ip());
-          continue;
+        // W6: binds to the group on Linux (as upstream) and to 0.0.0.0 on Windows (cannot bind to a
+        // multicast address there); joins the group on our NIC and enlarges the receive buffer.
+        let socket = match crate::util::sockopts::bind_multicast_receiver(
+          media_addr_v4,
+          self.self_info.ip_address,
+        ) {
+          Ok(socket) => socket,
+          Err(e) => {
+            error!(
+              "failed to bind/join multicast media socket {:?} on {}: {e:?}",
+              advbundle.media_addr, self.self_info.ip_address
+            );
+            continue;
+          }
         };
         let flow_index = match flows_locked.iter().position(|o| o.is_none()) {
           Some(i) => i,

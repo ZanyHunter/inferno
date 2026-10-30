@@ -36,6 +36,8 @@ impl UdpSocketWrapper {
     let socket_opt =
       UdpSocket::bind(SocketAddr::new(std::net::IpAddr::V4(listen_addr), listen_port)).await;
     let socket = socket_opt.expect("error starting really needed listener");
+    // W6: on Windows multicast egress follows the routing table, not the bound address.
+    super::sockopts::apply_multicast_egress_platform(&socket, listen_addr);
     // TODO MAY PANIC: this error should be non-fatal because some apps may use Inferno as an optional audio I/O
     let listen_port = socket.local_addr().unwrap().port();
     UdpSocketWrapper {
@@ -98,12 +100,16 @@ impl UdpSocketWrapper {
 
 pub async fn create_tokio_udp_socket(self_ip: Ipv4Addr) -> tokio::io::Result<(UdpSocket, u16)> {
   let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(self_ip), 0)).await?;
+  super::sockopts::apply_multicast_egress_platform(&socket, self_ip);
+  super::sockopts::apply_audio_buffers_platform(&socket, true, true);
   let port = socket.local_addr()?.port();
   return Ok((socket, port));
 }
 
 pub fn create_mio_udp_socket(self_ip: Ipv4Addr) -> std::io::Result<(mio::net::UdpSocket, u16)> {
   let socket = mio::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(self_ip), 0))?;
+  // Unicast audio RX socket (also sends keepalives): needs a big receive buffer on Windows.
+  super::sockopts::apply_audio_buffers_platform(&socket, true, true);
   let port = socket.local_addr()?.port();
   return Ok((socket, port));
 }
