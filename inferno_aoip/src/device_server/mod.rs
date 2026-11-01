@@ -41,7 +41,9 @@ pub(crate) mod settings;
 pub(crate) mod tx_multicasts;
 
 pub use crate::common::{Clock, ClockDiff, Sample};
-pub use crate::media_clock::{ClockOverlay, ClockPublisher, MediaClock, RealTimeClockReceiver};
+pub use crate::media_clock::{
+  ClockOverlay, ClockPublisher, ClockStatusHandle, HostClockStatus, MediaClock, RealTimeClockReceiver,
+};
 pub use crate::ring_buffer::{new_owned, ExternalBufferParameters, PositionReportDestination, RBInput};
 pub use settings::{
   default_state_dir, program_data_state_dir, sanitize_device_name, validate_device_name, NicInfo, NicSelector,
@@ -163,6 +165,7 @@ impl DeviceServer {
         self_info.clone(),
         mcast_rx,
         shared_media_clock.clone(),
+        settings.clock_status.clone(),
         channels_sub_rx,
         Box::new(move || ((rxps.read().unwrap())(), (txps.read().unwrap())())),
         shdn_recv3,

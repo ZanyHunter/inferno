@@ -9,6 +9,45 @@ use crate::common::*;
 use crate::util::real_time_box_channel::{self, RealTimeBoxReceiver};
 pub type RealTimeClockReceiver = RealTimeBoxReceiver<Option<ClockOverlay>>;
 
+/// ONS fork: what the host application knows about the clock it follows, for Dante's clock-stats
+/// reply (opcode 0x0021 on the info port, see `info_mcast_server`). Upstream Inferno learns this from a
+/// `/tmp/clock-stats.<mac>0000*` file written by a Linux PTP helper, which does not exist on Windows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostClockStatus {
+  /// Grandmaster clock id of the followed leader: the 6-byte PTPv1 UUID followed by two zero bytes
+  /// (the form of the first 16 hex digits of the `/tmp` file, for example `001dc12051f00000`).
+  /// `None` when no leader is followed; then no clock stats are sent.
+  pub master_clock_id: Option<[u8; 8]>,
+  /// The host's clock servo is locked to that leader. When false the reply carries the
+  /// "PLL not locked" flag.
+  pub locked: bool,
+}
+
+/// ONS fork: shared, cloneable cell through which the host supplies a [`HostClockStatus`]. Hand a clone
+/// to `SettingsBuilder::clock_status` and keep one to call [`ClockStatusHandle::set`] on from any
+/// thread, whenever the leader or lock state changes. Inferno reads it when a clock-stats request
+/// arrives, so updates need no further signalling. Starts as "no leader".
+#[derive(Clone, Debug, Default)]
+pub struct ClockStatusHandle {
+  inner: Arc<RwLock<HostClockStatus>>,
+}
+
+impl ClockStatusHandle {
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  /// Replace the status.
+  pub fn set(&self, status: HostClockStatus) {
+    *self.inner.write().unwrap() = status;
+  }
+
+  /// The current status.
+  pub fn get(&self) -> HostClockStatus {
+    *self.inner.read().unwrap()
+  }
+}
+
 /// High-precision clock (nanoseconds)
 pub type FineClock = u64;
 

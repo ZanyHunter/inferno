@@ -25,6 +25,7 @@ use netdev::mac::MacAddr;
 
 use crate::common::warn;
 use crate::device_info::{Channel, DeviceId, DeviceInfo};
+use crate::media_clock::ClockStatusHandle;
 use crate::protocol::flows_control::PORT as FLOWS_CONTROL_PORT;
 use crate::protocol::mcast::INFO_REQUEST_PORT;
 use crate::protocol::proto_arc::PORT as ARC_PORT;
@@ -320,6 +321,7 @@ pub struct SettingsBuilder {
   rx_channels: u16,
   tx_channels: u16,
   clock_path: Option<PathBuf>,
+  clock_status: Option<ClockStatusHandle>,
   use_safe_clock: bool,
   tx_source_bit_depth: u8,
   state_dir: Option<PathBuf>,
@@ -350,6 +352,7 @@ impl SettingsBuilder {
       rx_channels: 2,
       tx_channels: 2,
       clock_path: None,
+      clock_status: None,
       use_safe_clock: false,
       tx_source_bit_depth: 32,
       state_dir: None,
@@ -451,6 +454,13 @@ impl SettingsBuilder {
   /// Path of the clock socket (Unix) passed to the clock receiver. Default: none.
   pub fn clock_path(mut self, path: impl Into<PathBuf>) -> Self {
     self.clock_path = Some(path.into());
+    self
+  }
+
+  /// ONS fork: let the host supply the grandmaster id and lock state for Dante's clock-stats reply
+  /// (see [`ClockStatusHandle`]). Without it Inferno reads `/tmp/clock-stats.*` (Linux PTP helper).
+  pub fn clock_status(mut self, handle: ClockStatusHandle) -> Self {
+    self.clock_status = Some(handle);
     self
   }
 
@@ -596,6 +606,7 @@ impl SettingsBuilder {
       self_info,
       tx_latency_ns: self.tx_latency_ns,
       clock_path: self.clock_path,
+      clock_status: self.clock_status,
       use_safe_clock: self.use_safe_clock,
       tx_source_bit_depth: self.tx_source_bit_depth,
       state_dir,
@@ -699,6 +710,9 @@ pub struct Settings {
   pub self_info: DeviceInfo,
   pub tx_latency_ns: u32,
   pub clock_path: Option<PathBuf>,
+  /// ONS fork: host-supplied clock status for the clock-stats reply. `None` keeps the Linux
+  /// `/tmp/clock-stats.*` file path.
+  pub clock_status: Option<ClockStatusHandle>,
   pub use_safe_clock: bool,
   pub tx_source_bit_depth: u8,
   /// Persistent state directory (see [`SettingsBuilder::state_dir`], [`default_state_dir`]).
