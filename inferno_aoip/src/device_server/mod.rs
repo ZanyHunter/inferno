@@ -56,6 +56,16 @@ use samples_collector::{RealTimeSamplesReceiver, SamplesCallback, SamplesCollect
 const PEAKS_BUFFER_LEN: usize = 24000;
 const PEAKS_ITER_SLEEP: Duration = Duration::from_millis(100);
 
+/// ONS fork: wait for an audio thread without blocking the async worker that runs the shutdown, so a
+/// thread that does not end can be given up on by a timeout around `DeviceServer::shutdown`.
+async fn join_without_blocking(thread: std::thread::JoinHandle<()>) {
+  match tokio::task::spawn_blocking(move || thread.join()).await {
+    Ok(Ok(())) => {}
+    Ok(Err(_)) => error!("an audio thread panicked"),
+    Err(e) => error!("cannot wait for an audio thread: {e}"),
+  }
+}
+
 pub struct TransferNotifier {
   pub callback: Box<dyn Fn() + Send + Sync>,
   pub max_interval_samples: Clock,
@@ -281,7 +291,7 @@ impl DeviceServer {
     let shutdown_todo = async move {
       flows_rx_handle.shutdown().await;
       channels_sub_handle.shutdown().await;
-      flows_rx_thread.join().unwrap();
+      join_without_blocking(flows_rx_thread).await;
       for task in tasks {
         task.await.unwrap();
       }
@@ -381,7 +391,7 @@ impl DeviceServer {
         shutdown_send.send(()).unwrap();
         flows_control_task.await.unwrap();
         *flows_tx.lock().await = None;
-        flows_tx_thread.join().unwrap();
+        join_without_blocking(flows_tx_thread).await;
         //peaks_thread.join().unwrap();
         info!("transmitter stopped");
       }

@@ -40,6 +40,10 @@ const BUFFERED_SAMPLES_PER_CHANNEL: usize = 65536;
 pub const SELECT_THRESHOLD: Duration = Duration::from_millis(100);
 pub const PROCESS_EVENTS_INTERVAL: Duration = Duration::from_millis(33);
 pub const MIN_SLEEP: Duration = Duration::from_millis(0); // to save CPU cycles, TODO: make it configurable via some "eco mode" flag
+/// ONS fork: longest time the thread waits for a command or a flow's next timestamp without looking at the
+/// media clock again. The media clock can step (a PTP lock moves it by an arbitrary amount), and a wait
+/// computed from the old clock must not outlive the step.
+pub const MAX_IDLE_SLEEP: Duration = Duration::from_millis(250);
 
 // it's better to have the clock in the past than in the future - otherwise Dante devices receiving from us go mad and fart
 const CLOCK_OFFSET_NS: ClockDiff = -500_000;
@@ -92,6 +96,9 @@ enum Command {
 
 struct FlowsTransmitterInternal<P: ProxyToSamplesBuffer> {
   commands_receiver: mpsc::Receiver<Command>,
+  /// ONS fork: set by [`FlowsTransmitter::shutdown`] and when the handle is dropped. Checked on every
+  /// iteration, so the thread ends even if it is not getting to its command queue.
+  stop: Arc<AtomicBool>,
   clock_recv: RealTimeBoxReceiver<Option<ClockOverlay>>,
   sample_rate: u32,
   flows: Vec<Option<Flow>>,
@@ -115,6 +122,26 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
 
   fn now(&self) -> Option<LongClock> {
     self.clock.now_in_timebase(self.sample_rate as u64)
+  }
+
+  /// ONS fork: take in the newest media clock overlay (it may have stepped while the thread was
+  /// waiting).
+  fn refresh_clock(&mut self) {
+    if self.clock_recv.update() {
+      if let Some(ovl) = self.clock_recv.get() {
+        self.clock.update_overlay(*ovl);
+      }
+    }
+  }
+
+  /// ONS fork: the next queued command, without waiting. A closed queue (the handle is gone) means
+  /// shutdown; upstream treated it as "no command" here, so a busy thread never noticed.
+  fn next_command(&mut self) -> Command {
+    match self.commands_receiver.try_recv() {
+      Ok(command) => command,
+      Err(mpsc::error::TryRecvError::Empty) => Command::NoOp,
+      Err(mpsc::error::TryRecvError::Disconnected) => Command::Shutdown,
+    }
   }
 
   #[inline(always)]
@@ -274,6 +301,9 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
 
     set_current_thread_realtime(81);
     loop {
+      if self.stop.load(Ordering::Acquire) {
+        break;
+      }
       let min_next_ts = self
         .flows
         .iter()
@@ -288,11 +318,7 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
           .filter_map(|opt| opt)
           .min_by(|&a, &b| wrapped_diff(a as Clock, b as Clock).cmp(&0));
 
-      if self.clock_recv.update() {
-        if let Some(ovl) = self.clock_recv.get() {
-          self.clock.update_overlay(*ovl);
-        }
-      }
+      self.refresh_clock();
       let now = if let Some(now) = self.now() {
         now
       } else {
@@ -320,17 +346,23 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
           std::thread::sleep(sleep_duration);
         }
         if let Some(now) = self.now() {
+          // ONS fork: the media clock can step backwards (a PTP lock); a deadline set before the step
+          // would then be far in the future and keep the keepalive checks from ever running.
+          if wrapped_diff(next_process_events, now as Clock) > process_events_interval as ClockDiff {
+            next_process_events = now as Clock;
+          }
           let process_events = wrapped_diff(now as Clock, next_process_events) >= 0;
           self.transmit(&mut dither_rng, now, process_events);
           if process_events {
             next_process_events = (now as Clock).wrapping_add(process_events_interval);
-            self.commands_receiver.try_recv().unwrap_or(Command::NoOp)
-          } else {
-            Command::NoOp
           }
+          // ONS fork: look at the command queue on every pass, not only when the timer for the flows'
+          // keepalive checks fires. New flows, channel changes and the shutdown must not depend on the
+          // media clock behaving.
+          self.next_command()
         } else {
           error!("clock unavailable, can't transmit. is the PTP daemon running? (@non-select)");
-          self.commands_receiver.try_recv().unwrap_or(Command::NoOp)
+          self.next_command()
         }
       } else {
         // on_transfer callback must be called to notify about transmission in previous iteration,
@@ -342,7 +374,7 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
           recv_opt = self.commands_receiver.recv() => {
             recv_opt.unwrap_or(Command::Shutdown)
           },
-          _ = tokio::time::sleep(sleep_duration) => {
+          _ = tokio::time::sleep(sleep_duration.min(MAX_IDLE_SLEEP)) => {
             if let Some(now) = self.now() {
               self.transmit(&mut dither_rng, now, true);
             } else {
@@ -396,6 +428,9 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
             expires: if needs_keepalives { Some(0) } else { None },
             expired,
           };
+          // ONS fork: the thread may just have woken from a long wait during which the media clock
+          // stepped; start the flow on the current clock, not the one from before the wait.
+          self.refresh_clock();
           if let Some(now) = self.now() {
             flow.bootstrap_next_ts(now);
             if needs_keepalives {
@@ -409,6 +444,7 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
           self.flows[index] = None; // TODO is freeing memory in realtime thread safe???
         }
         Command::SetChannels { index, channel_indices } => {
+          self.refresh_clock();
           let now_opt = self.now();
           let flow = self.flows[index].as_mut().unwrap();
           flow.channel_indices = channel_indices;
@@ -456,7 +492,16 @@ pub struct FlowsTransmitter {
   flows: BTreeMap<u32, FlowData>,
   ip_port_to_id: BTreeMap<SocketAddr, u32>,
   commands_sender: mpsc::Sender<Command>,
+  /// Shared with the thread; see `FlowsTransmitterInternal::stop`.
+  stop: Arc<AtomicBool>,
   flows_info: Vec<Option<FlowInfo>>,
+}
+
+/// ONS fork: dropping the handle ends the thread, whatever state its command queue or media clock is in.
+impl Drop for FlowsTransmitter {
+  fn drop(&mut self) {
+    self.stop.store(true, Ordering::Release);
+  }
 }
 
 fn split_handle(h: FlowHandle) -> (u32, u16) {
@@ -466,6 +511,7 @@ fn split_handle(h: FlowHandle) -> (u32, u16) {
 impl FlowsTransmitter {
   async fn run<P: ProxyToSamplesBuffer>(
     rx: mpsc::Receiver<Command>,
+    stop: Arc<AtomicBool>,
     tx_source_bit_depth: u8,
     clock_recv: RealTimeBoxReceiver<Option<ClockOverlay>>,
     sample_rate: u32,
@@ -479,6 +525,7 @@ impl FlowsTransmitter {
     let latency: u32 = (latency_ns as u64 * sample_rate as u64 / 1_000_000_000u64).try_into().unwrap();
     let mut internal = FlowsTransmitterInternal {
       commands_receiver: rx,
+      stop,
       clock_recv,
       sample_rate,
       flows: (0..MAX_FLOWS).map(|_| None).collect_vec(),
@@ -508,11 +555,14 @@ impl FlowsTransmitter {
   ) -> (Self, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(100);
     let tx1 = tx.clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
     let srate = self_info.sample_rate;
     // TODO dehardcode latency_ns
     let thread_join = run_future_in_new_thread("flows TX", move || {
       Self::run(
         rx,
+        thread_stop,
         tx_source_bit_depth,
         clock_recv,
         srate,
@@ -529,6 +579,7 @@ impl FlowsTransmitter {
     return (
       Self {
         commands_sender: tx,
+        stop,
         self_info: self_info.clone(),
         flow_seq_id: 0.into(),
         flows: BTreeMap::new(),
@@ -539,6 +590,8 @@ impl FlowsTransmitter {
     );
   }
   pub async fn shutdown(&self) {
+    // ONS fork: the flag works even when the queue is not being read; the command wakes an idle thread.
+    self.stop.store(true, Ordering::Release);
     self.commands_sender.send(Command::Shutdown).await.log_and_forget();
   }
 

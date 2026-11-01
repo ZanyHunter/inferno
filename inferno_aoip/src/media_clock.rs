@@ -86,9 +86,13 @@ impl MediaClock {
     timebase_hz: u64,
   ) -> Option<std::time::Duration> {
     let duration_in_tb = wrapped_diff(until, from);
-    let duration_ns = (duration_in_tb as i64 * 1_000_000_000i64 / timebase_hz as i64) as FineClockDiff;
+    // ONS fork: 128 bit. A media clock that steps to a leader's time makes the difference to a stale
+    // timestamp so large that `* 1e9` overflows 64 bits (a panic in debug builds, a garbage sleep time
+    // in release builds).
+    let duration_ns = (duration_in_tb as i128 * 1_000_000_000i128 / timebase_hz as i128)
+      .clamp(i64::MIN as i128, i64::MAX as i128) as FineClockDiff;
     let corr = (duration_ns as f64 * self.overlay?.freq_scale) as FineClockDiff;
-    let duration = duration_ns - corr; // FIXME it should be * 1/(1+freq_scale) but should be good enough for low correction values
+    let duration = duration_ns.saturating_sub(corr); // FIXME it should be * 1/(1+freq_scale) but should be good enough for low correction values
     if duration > 0 {
       Some(std::time::Duration::from_nanos(duration as u64))
     } else {
@@ -255,6 +259,19 @@ mod tests {
     clock.update_overlay(overlay);
     assert!(clock.is_ready());
     assert!(clock.get_overlay().is_some());
+  }
+
+  #[test]
+  fn duration_until_a_timestamp_decades_away_does_not_overflow() {
+    let mut clock = MediaClock::new(false);
+    clock.update_overlay(ClockOverlay { clock_id: 1, last_sync: 0, shift: 0, freq_scale: 0.0 });
+    // 2e13 samples at 48 kHz is about 5 days: `* 1e9` overflows i64.
+    let far = 20_000_000_000_000usize;
+    let d = clock.system_clock_duration_from_until(0, far, 48_000).unwrap();
+    assert_eq!(d.as_secs(), 416_666_666);
+    // The other way round it is in the past: no wait.
+    let d = clock.system_clock_duration_from_until(far, 0, 48_000).unwrap();
+    assert_eq!(d, std::time::Duration::from_secs(0));
   }
 
   #[test]
