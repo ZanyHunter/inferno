@@ -27,12 +27,22 @@ const DST_PORT_DEVICE_INFO: u16 = 8702;
 
 pub type PeaksCallback = Box<dyn FnMut() -> (Vec<u8>, Vec<u8>) + Send + Sync>;
 
-/// First word of the clock-stats reply with the "PLL not locked" flag (bit 0x01 of the last byte) set.
-/// This is the value upstream Inferno always sent. The meaning of the bit comes from an upstream source
-/// comment (`0x01 = PLL not locked`) **(verify against Dante Controller on a real network)**.
-const CLOCK_STATS_FLAGS_PLL_NOT_LOCKED: [u8; 4] = [0x00, 0x03, 0x00, 0x03];
-/// The same word with the "PLL not locked" bit clear **(verify)**.
-const CLOCK_STATS_FLAGS_PLL_LOCKED: [u8; 4] = [0x00, 0x03, 0x00, 0x02];
+// Flags word (two u16) of the clock-stats reply, as observed on the wire from a Mac Dante Virtual
+// Soundcard on 2026-11-01 (the second word's bit 0x0002 means "locked"; the upstream source comment
+// that said `0x01 = PLL not locked` was wrong):
+//
+//   state                                      flags         freq offset     master id
+//   following a master and synced              00 03 00 03   small, in ppb   the leader
+//   just acquired a master, not yet locked     00 03 00 01   0               the leader
+//   no leader (reports itself as master)       00 01 00 06   -               its own MAC + 0000
+//
+// The not-locked row was seen twice, about 2 s before the device flipped to `00 03 00 03`. ONS sends
+// nothing when there is no leader instead of the `00 01 00 06` self-master form.
+
+/// Following a master and locked to it. The value upstream Inferno always sent.
+const CLOCK_STATS_FLAGS_PLL_LOCKED: [u8; 4] = [0x00, 0x03, 0x00, 0x03];
+/// Following a master but not locked yet; sent with a frequency offset of 0.
+const CLOCK_STATS_FLAGS_PLL_NOT_LOCKED: [u8; 4] = [0x00, 0x03, 0x00, 0x01];
 
 /// Flags word of the clock-stats reply for a host clock that is or is not locked.
 fn clock_stats_flags(locked: bool) -> [u8; 4] {
@@ -365,17 +375,18 @@ impl<'s> Multicaster<'s> {
     };
     let mac = self.self_info.mac_address.octets();
     // ONS fork: the host-supplied status wins when there is one; the Linux file is the fallback.
-    let (mc, flags) = match &self.host_clock_status {
+    let (mc, flags, freq_offset) = match &self.host_clock_status {
       Some(handle) => {
         let status = handle.get();
         match status.master_clock_id {
-          Some(id) => (id, clock_stats_flags(status.locked)),
+          // A DVS that follows a master but is not locked yet reports a frequency offset of 0.
+          Some(id) => (id, clock_stats_flags(status.locked), if status.locked { freq_offset } else { 0 }),
           None => return, // no leader followed: stay silent, Dante Controller shows the clock red
         }
       }
       None => match clock_stats_master_from_tmp_file(&mac) {
         // The file carries no lock information: send the historic flags word unchanged.
-        Some(id) => (id, CLOCK_STATS_FLAGS_PLL_NOT_LOCKED),
+        Some(id) => (id, CLOCK_STATS_FLAGS_PLL_LOCKED, freq_offset),
         None => return,
       },
     };
@@ -572,7 +583,8 @@ mod tests {
     assert_eq!(&pkt[24..32], &[0x07, 0x2a, 0x00, 0x20, 0, 0, 0, 0], "opcode");
     let c = &pkt[32..];
     assert_eq!(&c[0..4], &CLOCK_STATS_FLAGS_PLL_LOCKED);
-    assert_eq!(c[0..4], [0x00, 0x03, 0x00, 0x02]);
+    // As observed from a Mac DVS following a master and synced (2026-11-01).
+    assert_eq!(c[0..4], [0x00, 0x03, 0x00, 0x03]);
     assert_eq!(&c[4..8], &[0x00, 0x00, 0x00, 0x9f]);
     assert_eq!(&c[8..12], &freq_offset.to_be_bytes());
     assert_eq!(&c[12..18], &MAC);
@@ -583,20 +595,24 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn unlocked_host_status_sets_the_pll_not_locked_flag() {
+  async fn unlocked_host_status_sends_the_not_locked_flags_and_a_zero_offset() {
     let handle = ClockStatusHandle::new();
     handle.set(HostClockStatus { master_clock_id: Some(MASTER), locked: false });
-    let (pkt, _) = clock_stats_reply(Some(handle), running_clock()).await;
+    // The clock has a non-zero frequency offset; a not-locked reply must still carry 0.
+    let (pkt, freq_offset) = clock_stats_reply(Some(handle), running_clock()).await;
+    assert_ne!(freq_offset, Some(0));
     let pkt = pkt.expect("a clock-stats reply");
-    let flags = &pkt[32..36];
-    assert_eq!(flags, &CLOCK_STATS_FLAGS_PLL_NOT_LOCKED);
-    assert_eq!(flags[3] & 0x01, 0x01);
-    // Only the flags word differs from the locked reply.
-    assert_eq!(
-      clock_stats_content(clock_stats_flags(true), 5, MAC, MASTER)[4..],
-      clock_stats_content(clock_stats_flags(false), 5, MAC, MASTER)[4..]
-    );
-    assert_eq!(clock_stats_flags(true)[3] & 0x01, 0);
+    let c = &pkt[32..];
+    // As observed from a Mac DVS that had just acquired a master (2026-11-01).
+    assert_eq!(&c[0..4], &[0x00, 0x03, 0x00, 0x01]);
+    assert_eq!(&c[0..4], &CLOCK_STATS_FLAGS_PLL_NOT_LOCKED);
+    assert_eq!(&c[4..8], &[0x00, 0x00, 0x00, 0x9f]);
+    assert_eq!(&c[8..12], &0i32.to_be_bytes());
+    assert_eq!(&c[12..18], &MAC);
+    assert_eq!(&c[20..28], &MASTER);
+    assert_eq!(&c[28..36], &MASTER);
+    // Locked is the historic word.
+    assert_eq!(clock_stats_flags(true), [0x00, 0x03, 0x00, 0x03]);
   }
 
   #[tokio::test]

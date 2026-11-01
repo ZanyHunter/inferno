@@ -19,7 +19,7 @@ pub struct HostClockStatus {
   /// `None` when no leader is followed; then no clock stats are sent.
   pub master_clock_id: Option<[u8; 8]>,
   /// The host's clock servo is locked to that leader. When false the reply carries the
-  /// "PLL not locked" flag.
+  /// not-locked flags word and a frequency offset of 0, as a Mac DVS does after acquiring a master.
   pub locked: bool,
 }
 
