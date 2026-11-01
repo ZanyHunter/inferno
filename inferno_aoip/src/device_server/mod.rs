@@ -26,6 +26,7 @@ use crate::device_info::DeviceInfo;
 
 pub(crate) mod arc_server;
 pub(crate) mod cmc_server;
+pub(crate) mod device_name;
 pub(crate) mod flows_control_server;
 pub(crate) mod info_mcast_server;
 pub(crate) mod mdns_server;
@@ -45,6 +46,7 @@ pub use crate::media_clock::{
   ClockOverlay, ClockPublisher, ClockStatusHandle, HostClockStatus, MediaClock, RealTimeClockReceiver,
 };
 pub use crate::ring_buffer::{new_owned, ExternalBufferParameters, PositionReportDestination, RBInput};
+pub use device_name::{DeviceNaming, DeviceRename, RenameCallback};
 pub use settings::{
   default_state_dir, program_data_state_dir, sanitize_device_name, validate_device_name, NicInfo, NicSelector,
   Settings, SettingsBuilder, SettingsError, MAX_DEVICE_NAME_LEN,
@@ -110,6 +112,9 @@ impl DeviceServer {
   pub async fn start_with_clock(settings: settings::Settings, clock: Option<ClockPublisher>) -> Self {
     let self_info = Arc::new(settings.self_info);
     let state_storage = Arc::new(StateStorage::new(&self_info, &settings.state_dir));
+    // A name saved by an earlier rename wins over the configured one; it has to be in place before
+    // anything is advertised.
+    device_name::apply_saved_name(&settings.naming, &state_storage, &self_info);
     let ref_instant = Instant::now();
 
     let (shutdown_send, shdn_recv1) = broadcast_queue::channel(16);
@@ -158,6 +163,7 @@ impl DeviceServer {
         channels_sub_rx.clone(),
         flows_tx.clone(),
         tx_multicasts.clone(),
+        settings.naming.clone(),
         shdn_recv1,
       )),
       tokio::spawn(cmc_server::run_server(self_info.clone(), shdn_recv2)),

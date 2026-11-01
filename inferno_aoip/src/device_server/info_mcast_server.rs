@@ -87,6 +87,28 @@ fn clock_stats_master_from_tmp_file(mac: &[u8; 6]) -> Option<[u8; 8]> {
   None
 }
 
+/// Content of a sample rate or encoding status reply (opcodes `07 2a 00 80` and `07 2a 00 82`), ONS fork:
+/// offset of the value list counted from the opcode (`0x18`), number of values, current value, requested
+/// value, update mode, flags, then the supported values (all `u32`, big endian).
+///
+/// The update mode is 0 = fixed: the device does not let a controller change it (the layout and the
+/// mode meanings were checked against `netaudio`'s parser; Inferno's source quotes a hardware reply with
+/// mode 2 and four sample rates).
+fn capability_status_content(current: u32, supported: &[u32]) -> Vec<u8> {
+  const UPDATE_MODE_FIXED: u16 = 0;
+  let mut c = Vec::with_capacity(16 + 4 * supported.len());
+  c.extend_from_slice(&0x18u16.to_be_bytes());
+  c.extend_from_slice(&(supported.len() as u16).to_be_bytes());
+  c.extend_from_slice(&current.to_be_bytes());
+  c.extend_from_slice(&current.to_be_bytes());
+  c.extend_from_slice(&UPDATE_MODE_FIXED.to_be_bytes());
+  c.extend_from_slice(&0u16.to_be_bytes());
+  for v in supported {
+    c.extend_from_slice(&v.to_be_bytes());
+  }
+  c
+}
+
 struct Multicaster<'s> {
   self_info: &'s DeviceInfo,
   pub server: UdpSocketWrapper,
@@ -184,10 +206,9 @@ impl<'s> Multicaster<'s> {
     //       0x10 - has Manufacturer name
     //       0x40 - Network is configurable (supports static addressing)
     // 0x17: Identify device, Sample rate & encoding configuration, Reboot, Factory reset (was 0xdb)
-    content[0x14] = 0;
-    content[0x15] = 0;
-    content[0x16] = 0x10;
-    content[0x17] = 0;
+    // ONS fork: the host can choose the flags (`SettingsBuilder::board_flags`); the default is the
+    // upstream value [0, 0, 0x10, 0].
+    content[0x14..0x18].copy_from_slice(&self.self_info.capabilities.board_flags);
 
     content[0xbb] = 0x1f; // if 0, device is flooded with info multicast requests around 1 per second
                           /* content[0xbf] = 5;
@@ -197,6 +218,19 @@ impl<'s> Multicaster<'s> {
     write_str_to_buffer(&mut content, 0x38, 16, &self.self_info.board_name);
 
     self.send(self.device_info_destination, 0xffff, [0x07, 0x2a, 0x00, 0x60, 0, 0, 0, 0], &content).await;
+  }
+
+  /// Reply to a sample rate status request (`07 xx 00 81`): opcode `07 2a 00 80`.
+  async fn send_sample_rate_status(&mut self) {
+    let content = capability_status_content(self.self_info.sample_rate, &[self.self_info.sample_rate]);
+    self.send(self.device_info_destination, 0xffff, [0x07, 0x2a, 0x00, 0x80, 0, 0, 0, 0], &content).await;
+  }
+
+  /// Reply to an encoding status request (`07 xx 00 83`): opcode `07 2a 00 82`.
+  async fn send_encoding_status(&mut self) {
+    let bits = u32::from(self.self_info.bits_per_sample);
+    let content = capability_status_content(bits, &[bits]);
+    self.send(self.device_info_destination, 0xffff, [0x07, 0x2a, 0x00, 0x82, 0, 0, 0, 0], &content).await;
   }
 
   async fn send_product_info(&mut self) {
@@ -464,6 +498,12 @@ pub async fn run_server(
           [0x07, _, 0, 0xc1, 0, 0, 0, 0] => {
             mcaster.send_product_info().await;
           },
+          [0x07, _, 0, 0x81, 0, 0, 0, _] => {
+            mcaster.send_sample_rate_status().await;
+          },
+          [0x07, _, 0, 0x83, 0, 0, 0, _] => {
+            mcaster.send_encoding_status().await;
+          },
           [0x07, _ /* was 0x38 */, 0, 0x21, 0, 0, 0, _ /* was 0x64 */] => {
             mcaster.send_clock_stats().await;
           },
@@ -526,7 +566,7 @@ mod tests {
       factory_device_id: [1, 2, 3, 4, 5, 6, 7, 8],
       process_id: 9,
       vendor_string: String::new(),
-      friendly_hostname: String::new(),
+      friendly_hostname: Default::default(),
       factory_hostname: String::new(),
       rx_channels: Vec::new(),
       tx_channels: Vec::new(),
@@ -534,6 +574,7 @@ mod tests {
       pcm_type: 0xe,
       latency_ns: 0,
       sample_rate: 48_000,
+      capabilities: crate::device_info::DeviceCapabilities::fixed_latency(0),
       arc_port: 0,
       cmc_port: 0,
       flows_control_port: 0,
@@ -640,6 +681,53 @@ mod tests {
     let (pkt, freq_offset) = clock_stats_reply(Some(handle), clock).await;
     assert!(freq_offset.is_none());
     assert!(pkt.is_none());
+  }
+
+  /// Sent datagrams of one reply method, captured on a loopback socket.
+  async fn capture(
+    info: &DeviceInfo,
+    send: impl for<'a, 'b> FnOnce(&'a mut Multicaster<'b>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>,
+  ) -> Vec<u8> {
+    let (_shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let server = UdpSocketWrapper::new(Some(Ipv4Addr::LOCALHOST), 0, shutdown_rx).await;
+    let mut mcaster = Multicaster::new(info, server, running_clock(), None, Box::new(|| (vec![], vec![])));
+    let sink = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    mcaster.device_info_destination = sink.local_addr().unwrap();
+    send(&mut mcaster).await;
+    let mut buf = [0u8; 1500];
+    let (n, _) = tokio::time::timeout(Duration::from_millis(300), sink.recv_from(&mut buf))
+      .await
+      .expect("a reply")
+      .unwrap();
+    buf[..n].to_vec()
+  }
+
+  /// The sample rate reply of a fixed 48 kHz device; layout checked against `netaudio`'s parser.
+  #[tokio::test]
+  async fn sample_rate_status_reports_a_fixed_48k() {
+    let pkt = capture(&test_info(), |m| Box::pin(m.send_sample_rate_status())).await;
+    assert_eq!(&pkt[24..32], &[0x07, 0x2a, 0x00, 0x80, 0, 0, 0, 0]);
+    assert_eq!(
+      &pkt[32..],
+      &[0x00, 0x18, 0x00, 0x01, 0, 0, 0xbb, 0x80, 0, 0, 0xbb, 0x80, 0x00, 0x00, 0x00, 0x00, 0, 0, 0xbb, 0x80]
+    );
+  }
+
+  #[tokio::test]
+  async fn encoding_status_reports_fixed_24_bit() {
+    let pkt = capture(&test_info(), |m| Box::pin(m.send_encoding_status())).await;
+    assert_eq!(&pkt[24..32], &[0x07, 0x2a, 0x00, 0x82, 0, 0, 0, 0]);
+    assert_eq!(&pkt[32..], &[0x00, 0x18, 0x00, 0x01, 0, 0, 0, 24, 0, 0, 0, 24, 0, 0, 0, 0, 0, 0, 0, 24]);
+  }
+
+  #[tokio::test]
+  async fn board_info_carries_the_capability_flags_of_the_device() {
+    let mut info = test_info();
+    let default_pkt = capture(&info, |m| Box::pin(m.send_board_info())).await;
+    assert_eq!(&default_pkt[32 + 0x14..32 + 0x18], &[0, 0, 0x10, 0], "upstream default");
+    info.capabilities.board_flags = [0x01, 0x50, 0x10, 0x00];
+    let pkt = capture(&info, |m| Box::pin(m.send_board_info())).await;
+    assert_eq!(&pkt[32 + 0x14..32 + 0x18], &[0x01, 0x50, 0x10, 0x00]);
   }
 
   #[tokio::test]
