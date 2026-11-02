@@ -120,6 +120,45 @@ fn bundle_service(self_info: &DeviceInfo, hostname: &str, bundle_id: usize, b: &
   .unwrap()
 }
 
+/// Multicast the answers for `services` on mDNS from `ip`, now and once more after a second (RFC 6762
+/// section 8.3 asks for at least two announcements). Runs on its own thread so that the caller, an
+/// ARC request handler, is not held up; failures are only logged.
+fn announce_unsolicited(ip: Ipv4Addr, services: Vec<Service>) {
+  use searchfire::dns::serialize::binary::BinEncodable;
+  let packets: Vec<Vec<u8>> =
+    services.iter().filter_map(|s| s.dns_response().ok()).filter_map(|m| m.to_bytes().ok()).collect();
+  if packets.is_empty() {
+    return;
+  }
+  let spawned = std::thread::Builder::new().name("mdns announce".into()).spawn(move || {
+    let send = || -> std::io::Result<()> {
+      use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+      let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+      sock.bind(&SockAddr::from(std::net::SocketAddrV4::new(ip, 0)))?;
+      sock.set_multicast_if_v4(&ip)?;
+      sock.set_multicast_loop_v4(true)?;
+      sock.set_multicast_ttl_v4(255)?;
+      let sock: std::net::UdpSocket = sock.into();
+      for p in &packets {
+        sock.send_to(p, (Ipv4Addr::new(224, 0, 0, 251), 5353))?;
+      }
+      Ok(())
+    };
+    for round in 0..2 {
+      if round > 0 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+      }
+      if let Err(e) = send() {
+        log::warn!("cannot announce the renamed device on mDNS: {e}");
+        return;
+      }
+    }
+  });
+  if let Err(e) = spawned {
+    log::warn!("cannot start the mDNS announcement: {e}");
+  }
+}
+
 impl DeviceMDNSResponder {
   pub fn start(
     self_info: Arc<DeviceInfo>,
@@ -302,14 +341,21 @@ impl DeviceMDNSResponder {
 
     self.self_info.set_friendly_hostname(new_name);
 
-    handle.add_service(arc_service(&self.self_info, new_name)).log_and_forget();
-    handle.add_service(cmc_service(&self.self_info, new_name)).log_and_forget();
+    // The responder only answers queries, so tell the network about the new records unprompted: a
+    // controller that has just dropped the old device (goodbye) would otherwise wait for its next browse.
+    let mut announce = vec![arc_service(&self.self_info, new_name), cmc_service(&self.self_info, new_name)];
     for index in &announced.tx_channels {
-      self.add_tx_channel_services(handle, *index, new_name);
+      let (factory, friendly) = self.channel_names(*index);
+      announce.push(self.channel_service(*index, &factory, true, new_name));
+      announce.extend(friendly.map(|f| self.channel_service(*index, &f, false, new_name)));
     }
     for (bundle_id, bundle) in &announced.bundles {
-      handle.add_service(bundle_service(&self.self_info, new_name, *bundle_id, bundle)).log_and_forget();
+      announce.push(bundle_service(&self.self_info, new_name, *bundle_id, bundle));
     }
+    for service in &announce {
+      handle.add_service(service.clone()).log_and_forget();
+    }
+    announce_unsolicited(self.self_info.ip_address, announce);
   }
 
   pub fn reserve_multicast_ip(&self, addr: Ipv4Addr) {
