@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use toml;
 
 const PATH_SUFFIX: &str = ".toml";
+/// Retries of a rename that failed with "access denied" (see [`StateStorage::save`]).
+const RENAME_RETRIES: u32 = 10;
+const RENAME_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Per-device persistent state: one TOML file per item (`rx_channels.toml`, ...) in
 /// `<state_dir>/<device id hex>/`. The format stays TOML (upstream's choice); see FORK.md.
@@ -33,14 +36,33 @@ impl StateStorage {
   fn full_path(&self, name: &str) -> PathBuf {
     self.dir.join(format!("{name}{PATH_SUFFIX}"))
   }
+  /// Writes the item to a temp file, flushes it to disk and renames it over the old one, so a reader
+  /// (or a restart after a kill) sees either the old or the new content, never a partial file.
+  /// ONS fork: the data is synced before the rename, and a rename that Windows refuses because
+  /// another process briefly holds the old file open (antivirus, indexer) is retried; the old file
+  /// would otherwise survive and resurrect state that was already removed (issue #138).
   pub fn save(&self, name: &str, value: &impl Serialize) -> Result<(), Box<dyn Error>> {
     let content = toml::to_string(&value)?;
     let tmp_path = self.full_path(&format!("tmp.{name}"));
     let mut file = File::create(&tmp_path)?;
     file.write_all(content.as_bytes())?;
+    file.sync_all()?;
     drop(file);
-    std::fs::rename(tmp_path, self.full_path(name))?;
-    Ok(())
+    let final_path = self.full_path(name);
+    let mut attempt = 0;
+    loop {
+      match std::fs::rename(&tmp_path, &final_path) {
+        Ok(()) => return Ok(()),
+        Err(e) if attempt < RENAME_RETRIES && e.kind() == std::io::ErrorKind::PermissionDenied => {
+          attempt += 1;
+          std::thread::sleep(RENAME_RETRY_DELAY);
+        }
+        Err(e) => {
+          let _ = std::fs::remove_file(&tmp_path);
+          return Err(e.into());
+        }
+      }
+    }
   }
   /// ONS fork: delete an item. Removing an item that does not exist is not an error.
   pub fn remove(&self, name: &str) -> Result<(), Box<dyn Error>> {
