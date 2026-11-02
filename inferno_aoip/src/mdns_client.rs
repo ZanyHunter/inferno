@@ -6,7 +6,7 @@ use std::{
   net::{Ipv4Addr, SocketAddr, SocketAddrV4},
   str::{self},
   sync::Arc,
-  time::Duration,
+  time::{Duration, Instant},
 };
 
 use searchfire::{
@@ -19,6 +19,39 @@ use searchfire::{
 };
 
 pub type TxtEntries = BTreeMap<String, String>;
+
+/// Total time a unicast-style lookup (`query`) waits for an answer, and how long each transmission of
+/// the question gets before it is repeated. ONS fork (issue #131): a question sent once while the
+/// link or the switch's multicast forwarding was not ready after a cable pull was simply lost, and
+/// the caller then waited for its own retry timer (about 15 s in total).
+const QUERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(3);
+const QUERY_RETRANSMIT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Calls `attempt(timeout)` until it succeeds or `total` has passed. Each attempt gets at most
+/// `per_try`; an attempt that fails sooner (for example because the send failed) is not repeated
+/// before `per_try` has passed since it started, so a persistent error does not spin.
+async fn retransmitting<T, E, F, Fut>(total: Duration, per_try: Duration, mut attempt: F) -> Result<T, E>
+where
+  F: FnMut(Duration) -> Fut,
+  Fut: std::future::Future<Output = Result<T, E>>,
+{
+  let start = Instant::now();
+  loop {
+    let try_start = Instant::now();
+    let remaining = total.saturating_sub(start.elapsed());
+    let result = attempt(per_try.min(remaining)).await;
+    if result.is_ok() || start.elapsed() >= total {
+      return result;
+    }
+    let spent = try_start.elapsed();
+    if spent < per_try {
+      tokio::time::sleep((per_try - spent).min(total.saturating_sub(start.elapsed()))).await;
+    }
+    if start.elapsed() >= total {
+      return result;
+    }
+  }
+}
 
 #[derive(Debug)]
 pub struct AdvertisedService {
@@ -119,6 +152,16 @@ impl MdnsClient {
       .await
       .map_err(|e| Box::new(e).into())
   }
+  /// [`do_single_query`](Self::do_single_query) with an error that can be held across an `await` in a
+  /// spawned task (`Box<dyn Error>` cannot).
+  async fn do_single_query_sendable(
+    &self,
+    types: &[RecordType],
+    fqdn: &Name,
+    timeout: Duration,
+  ) -> Result<DnsResponse, String> {
+    self.do_single_query(types, fqdn, timeout).await.map_err(|e| e.to_string())
+  }
   async fn a_record_exists_single_check(
     &self,
     fqdn_parts: &[&str],
@@ -163,8 +206,10 @@ impl MdnsClient {
   pub async fn query(&self, fqdn_parts: &[&str]) -> Result<AdvertisedService, Box<dyn Error>> {
     debug!("resolving {fqdn_parts:?}");
     let fqdn = Name::from_labels(fqdn_parts.iter().map(|&s| s.as_bytes())).map_err(|e| Box::new(e))?;
-    let response =
-      self.do_single_query(&[RecordType::SRV, RecordType::TXT], &fqdn, Duration::from_secs(3)).await?;
+    let response = retransmitting(QUERY_TOTAL_TIMEOUT, QUERY_RETRANSMIT_INTERVAL, |timeout| {
+      self.do_single_query_sendable(&[RecordType::SRV, RecordType::TXT], &fqdn, timeout)
+    })
+    .await?;
     let mut target = None;
     let mut properties = BTreeMap::new();
     for record in response.answers() {
@@ -200,7 +245,10 @@ impl MdnsClient {
       }
       // if at this point we haven't returned from this method,
       // it means that additional A record wasn't contained in the response
-      let a_response = self.do_single_query(&[RecordType::A], &name, Duration::from_secs(3)).await?;
+      let a_response = retransmitting(QUERY_TOTAL_TIMEOUT, QUERY_RETRANSMIT_INTERVAL, |timeout| {
+        self.do_single_query_sendable(&[RecordType::A], &name, timeout)
+      })
+      .await?;
       for record in a_response.answers() {
         if record.name().to_lowercase() != name.to_lowercase() {
           continue;
@@ -308,5 +356,63 @@ impl MdnsClient {
       min_rx_latency_ns: parse_int("latency_ns")?,
       media_addr,
     });
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::sync::atomic::{AtomicUsize, Ordering};
+
+  #[tokio::test]
+  async fn retransmits_until_an_attempt_succeeds() {
+    let calls = AtomicUsize::new(0);
+    let result: Result<usize, ()> =
+      retransmitting(Duration::from_millis(600), Duration::from_millis(50), |_| async {
+        let n = calls.fetch_add(1, Ordering::SeqCst);
+        // the first two questions are lost (they time out), the third is answered
+        if n < 2 {
+          tokio::time::sleep(Duration::from_millis(50)).await;
+          Err(())
+        } else {
+          Ok(n)
+        }
+      })
+      .await;
+    assert_eq!(result, Ok(2));
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+  }
+
+  #[tokio::test]
+  async fn a_failing_attempt_does_not_spin() {
+    let calls = AtomicUsize::new(0);
+    let start = Instant::now();
+    let result: Result<(), &str> =
+      retransmitting(Duration::from_millis(300), Duration::from_millis(100), |_| async {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Err("send failed at once")
+      })
+      .await;
+    assert_eq!(result, Err("send failed at once"));
+    assert!(start.elapsed() >= Duration::from_millis(290), "gave up after {:?}", start.elapsed());
+    // one attempt per 100 ms window, 3 windows
+    assert!(calls.load(Ordering::SeqCst) <= 4, "{} attempts", calls.load(Ordering::SeqCst));
+  }
+
+  #[tokio::test]
+  async fn the_last_attempt_gets_only_the_remaining_time() {
+    let seen = std::sync::Mutex::new(vec![]);
+    let _: Result<(), ()> = retransmitting(Duration::from_millis(250), Duration::from_millis(100), |t| {
+      seen.lock().unwrap().push(t);
+      async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        Err(())
+      }
+    })
+    .await;
+    let seen = seen.into_inner().unwrap();
+    assert_eq!(seen[0], Duration::from_millis(100));
+    assert!(seen.last().unwrap() <= &Duration::from_millis(100));
+    assert!(seen.iter().all(|t| *t <= Duration::from_millis(100)));
   }
 }
