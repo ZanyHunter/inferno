@@ -151,7 +151,9 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
                     3 => sink.write_from_at(ts as usize, S24ReaderIterator(reader)),
                     4 => sink.write_from_at(ts as usize, S32ReaderIterator(reader)),
                     other => {
-                      panic!("unsupported bytes per sample {}", other);
+                      // Unreachable: the mDNS advertisement parser only lets 16, 24 and 32 bits through.
+                      error!("unsupported bytes per sample {}", other);
+                      0
                     }
                   };
                 });

@@ -85,6 +85,13 @@ pub struct TransferNotifier {
   pub max_interval_samples: Clock,
 }
 
+/// The receive latency handed to the subscriber, which uses it as the smallest latency of every flow
+/// (`max(latency the sender asks for, this)`). ONS fork: upstream passed `tx_latency_ns` here (FIXME
+/// "should be RX latency"), so the receive latency setting did not affect the flows at all.
+pub(crate) fn rx_latency_ns(self_info: &DeviceInfo) -> u32 {
+  u32::try_from(self_info.latency_ns).unwrap_or(u32::MAX)
+}
+
 pub struct DeviceServer {
   pub self_info: Arc<DeviceInfo>,
   ref_instant: Instant,
@@ -325,7 +332,7 @@ impl DeviceServer {
       self.mdns_client.clone(),
       self.mcast_tx.clone(),
       channels_buffering,
-      self.tx_latency_ns, /* FIXME should be RX latency */
+      rx_latency_ns(&self.self_info),
       self.state_storage.clone(),
       srx2,
       self.ref_instant,
@@ -493,5 +500,30 @@ impl DeviceServer {
     self.shutdown_todo.await;
     self.clock_receiver.stop().await;
     info!("shutdown ok");
+  }
+}
+
+#[cfg(test)]
+mod rx_latency_tests {
+  use super::*;
+  use crate::device_server::settings::SettingsBuilder;
+
+  fn settings(rx_ns: usize, tx_ns: u32) -> settings::Settings {
+    SettingsBuilder::new("test", "test")
+      .nic_info(crate::device_server::settings::NicInfo::new(std::net::Ipv4Addr::new(192, 168, 1, 2)))
+      .nic(crate::device_server::settings::NicSelector::Ipv4(std::net::Ipv4Addr::new(192, 168, 1, 2)))
+      .rx_latency_ns(rx_ns)
+      .tx_latency_ns(tx_ns)
+      .build()
+      .unwrap()
+  }
+
+  #[test]
+  fn the_subscriber_gets_the_rx_latency_not_the_tx_latency() {
+    for (rx, tx) in [(4_000_000usize, 10_000_000u32), (10_000_000, 4_000_000), (6_000_000, 6_000_000)] {
+      let s = settings(rx, tx);
+      assert_eq!(rx_latency_ns(&s.self_info), rx as u32);
+      assert_eq!(s.tx_latency_ns, tx);
+    }
   }
 }

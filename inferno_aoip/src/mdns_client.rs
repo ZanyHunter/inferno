@@ -266,26 +266,6 @@ impl MdnsClient {
     return Err(Box::new(io::Error::from(io::ErrorKind::NotFound)));
   }
 
-  fn parse_int_from_dict(dict: &BTreeMap<String, String>, key: &str) -> Result<usize, Box<dyn Error>> {
-    match dict.get(key) {
-      Some(s) => {
-        let result =
-          if s.starts_with("0x") { usize::from_str_radix(&s[2..], 16) } else { s.parse::<usize>() };
-        match result {
-          Ok(v) => Ok(v),
-          Err(e) => {
-            error!("unable to parse {key}={s}");
-            return Err(Box::new(e));
-          }
-        }
-      }
-      None => {
-        error!("{key} not found in dns response");
-        return Err(Box::new(io::Error::from(io::ErrorKind::NotFound)));
-      }
-    }
-  }
-
   pub async fn query_chan(
     &self,
     tx_hostname: &str,
@@ -294,75 +274,361 @@ impl MdnsClient {
     let full_name = format!("{}@{}", tx_channel_name, tx_hostname);
     let fqdn = [&full_name, "_netaudio-chan", "_udp", "local"];
     let result = self.query(&fqdn).await?;
-    let parse_int =
-      |key| -> Result<usize, Box<dyn Error>> { Self::parse_int_from_dict(&result.properties, key) };
-    let mut multicast = None;
-    for (key, value) in &result.properties {
-      if key.starts_with("b.") {
-        multicast = Some(PointerToMulticast {
-          tx_hostname: tx_hostname.to_owned(),
-          bundle_id: match key[2..].parse::<usize>() {
-            Ok(v) => v,
-            Err(_e) => {
-              error!("Unable to parse multicast bundle key {key}");
-              break;
-            }
-          },
-          channel_in_bundle: match value.parse::<usize>() {
-            Ok(v) if v > 0 => v - 1,
-            _ => {
-              error!("Unable to parse multicast bundle value {value}");
-              break;
-            }
-          },
-        });
-        break;
-      }
-    }
-    let (fpp1, fpp2) = result
-      .properties
-      .get("fpp")
-      .ok_or(Box::new(io::Error::from(io::ErrorKind::NotFound)))?
-      .split_once(",")
-      .ok_or(Box::new(io::Error::from(io::ErrorKind::InvalidData)))?;
-    return Ok(AdvertisedChannel {
-      addr: result.addr,
-      tx_channels_per_flow: parse_int("nchan")?,
-      tx_channel_id: parse_int("id")? as u16,
-      bits_per_sample: parse_int("enc").or_else(|_| parse_int("en"))? as u32,
-      dbcp1: parse_int("dbcp1")? as u16,
-      fpp_min: fpp2.parse()?,
-      fpp_max: fpp1.parse()?,
-      min_rx_latency_ns: parse_int("latency_ns")?,
-      multicast,
-    });
+    parse_channel_properties(result.addr, tx_hostname, &result.properties)
   }
 
   pub async fn query_bund(&self, full_name: &str) -> Result<AdvertisedBundle, Box<dyn Error>> {
     let fqdn = [full_name, "_netaudio-bund", "_udp", "local"];
     let result = self.query(&fqdn).await?;
-    let parse_int =
-      |key| -> Result<usize, Box<dyn Error>> { Self::parse_int_from_dict(&result.properties, key) };
-    let ip =
-      result.properties.get("a.0").ok_or(Box::new(io::Error::from(io::ErrorKind::NotFound)))?.parse()?;
-    let port =
-      result.properties.get("p.0").ok_or(Box::new(io::Error::from(io::ErrorKind::NotFound)))?.parse()?;
-    let media_addr = SocketAddr::V4(SocketAddrV4::new(ip, port));
-    return Ok(AdvertisedBundle {
-      tx_channels_per_flow: parse_int("nchan")?,
-      tx_bundle_id: parse_int("id")? as u16,
-      bits_per_sample: parse_int("enc").or_else(|_| parse_int("en"))? as u32,
-      fpp: parse_int("fpp")? as u16,
-      min_rx_latency_ns: parse_int("latency_ns")?,
-      media_addr,
-    });
+    parse_bundle_properties(&result.properties)
   }
+}
+
+/// The most channels a flow may carry according to a transmitter's mDNS records. Dante flows carry at
+/// most 8 channels (the largest unicast flow we ever request is 8); the margin keeps a future device
+/// working while a hostile or broken record (`nchan=4000000000`) cannot make us allocate per-channel
+/// state for billions of channels. ONS fork (issue #92).
+pub const MAX_ADVERTISED_CHANNELS_PER_FLOW: usize = 64;
+
+/// The longest minimum receive latency a transmitter may ask for. Anything longer is a broken record
+/// (and would overflow the latency arithmetic).
+const MAX_ADVERTISED_LATENCY_NS: usize = 10_000_000_000;
+
+fn invalid_data(what: impl Into<String>) -> Box<dyn Error> {
+  Box::new(io::Error::new(io::ErrorKind::InvalidData, what.into()))
+}
+
+/// Reads the number `key` from the TXT properties, decimal or `0x` hexadecimal.
+fn parse_int_from_dict(dict: &TxtEntries, key: &str) -> Result<usize, Box<dyn Error>> {
+  match dict.get(key) {
+    Some(s) => {
+      let result = match s.strip_prefix("0x") {
+        Some(hex) => usize::from_str_radix(hex, 16),
+        None => s.parse::<usize>(),
+      };
+      match result {
+        Ok(v) => Ok(v),
+        Err(e) => {
+          error!("unable to parse {key}={s}");
+          Err(Box::new(e))
+        }
+      }
+    }
+    None => {
+      error!("{key} not found in dns response");
+      Err(Box::new(io::Error::from(io::ErrorKind::NotFound)))
+    }
+  }
+}
+
+/// A number that must fit `u16` (the protocol's channel, bundle and port ids).
+fn parse_u16_from_dict(dict: &TxtEntries, key: &str) -> Result<u16, Box<dyn Error>> {
+  let v = parse_int_from_dict(dict, key)?;
+  u16::try_from(v).map_err(|_| invalid_data(format!("{key}={v} does not fit 16 bits")))
+}
+
+/// The sample size in bits, which must be one the receiver can decode (16, 24 or 32).
+fn parse_encoding(dict: &TxtEntries) -> Result<u32, Box<dyn Error>> {
+  let bits = parse_int_from_dict(dict, "enc").or_else(|_| parse_int_from_dict(dict, "en"))?;
+  match bits {
+    16 | 24 | 32 => Ok(bits as u32),
+    other => Err(invalid_data(format!("unsupported sample size of {other} bits"))),
+  }
+}
+
+fn parse_channels_per_flow(dict: &TxtEntries) -> Result<usize, Box<dyn Error>> {
+  let nchan = parse_int_from_dict(dict, "nchan")?;
+  if (1..=MAX_ADVERTISED_CHANNELS_PER_FLOW).contains(&nchan) {
+    Ok(nchan)
+  } else {
+    Err(invalid_data(format!("nchan={nchan} is outside 1..={MAX_ADVERTISED_CHANNELS_PER_FLOW}")))
+  }
+}
+
+fn parse_latency_ns(dict: &TxtEntries) -> Result<usize, Box<dyn Error>> {
+  let latency = parse_int_from_dict(dict, "latency_ns")?;
+  if latency > MAX_ADVERTISED_LATENCY_NS {
+    return Err(invalid_data(format!("latency_ns={latency} is implausibly long")));
+  }
+  Ok(latency)
+}
+
+/// Turns the TXT properties of a `_netaudio-chan` service into an [`AdvertisedChannel`]. The records come
+/// from the network, so every value is range checked: an `Ok` result always has `1..=64` channels per
+/// flow, 16, 24 or 32 bits per sample, a nonzero maximum frames per packet and a sane latency, which
+/// the subscriber relies on (chunk sizes, divisions, sample decoding). Never panics.
+pub(crate) fn parse_channel_properties(
+  addr: SocketAddr,
+  tx_hostname: &str,
+  properties: &TxtEntries,
+) -> Result<AdvertisedChannel, Box<dyn Error>> {
+  let mut multicast = None;
+  for (key, value) in properties {
+    if let Some(bundle) = key.strip_prefix("b.") {
+      multicast = Some(PointerToMulticast {
+        tx_hostname: tx_hostname.to_owned(),
+        bundle_id: match bundle.parse::<usize>() {
+          Ok(v) => v,
+          Err(_e) => {
+            error!("Unable to parse multicast bundle key {key}");
+            break;
+          }
+        },
+        channel_in_bundle: match value.parse::<usize>() {
+          Ok(v) if v > 0 => v - 1,
+          _ => {
+            error!("Unable to parse multicast bundle value {value}");
+            break;
+          }
+        },
+      });
+      break;
+    }
+  }
+  let (fpp1, fpp2) = properties
+    .get("fpp")
+    .ok_or(Box::new(io::Error::from(io::ErrorKind::NotFound)))?
+    .split_once(",")
+    .ok_or(Box::new(io::Error::from(io::ErrorKind::InvalidData)))?;
+  let fpp_min: u16 = fpp2.parse()?;
+  let fpp_max: u16 = fpp1.parse()?;
+  if fpp_max == 0 {
+    return Err(invalid_data("fpp maximum is 0"));
+  }
+  Ok(AdvertisedChannel {
+    addr,
+    tx_channels_per_flow: parse_channels_per_flow(properties)?,
+    tx_channel_id: parse_u16_from_dict(properties, "id")?,
+    bits_per_sample: parse_encoding(properties)?,
+    dbcp1: parse_u16_from_dict(properties, "dbcp1")?,
+    fpp_min,
+    fpp_max,
+    min_rx_latency_ns: parse_latency_ns(properties)?,
+    multicast,
+  })
+}
+
+/// Turns the TXT properties of a `_netaudio-bund` service into an [`AdvertisedBundle`], with the same
+/// guarantees as [`parse_channel_properties`]; the media address is a multicast group and a nonzero port.
+pub(crate) fn parse_bundle_properties(
+  properties: &TxtEntries,
+) -> Result<AdvertisedBundle, Box<dyn Error>> {
+  let ip: Ipv4Addr =
+    properties.get("a.0").ok_or(Box::new(io::Error::from(io::ErrorKind::NotFound)))?.parse()?;
+  let port: u16 =
+    properties.get("p.0").ok_or(Box::new(io::Error::from(io::ErrorKind::NotFound)))?.parse()?;
+  if !ip.is_multicast() || port == 0 {
+    return Err(invalid_data(format!("{ip}:{port} is not a multicast media address")));
+  }
+  let fpp = parse_u16_from_dict(properties, "fpp")?;
+  if fpp == 0 {
+    return Err(invalid_data("fpp is 0"));
+  }
+  Ok(AdvertisedBundle {
+    tx_channels_per_flow: parse_channels_per_flow(properties)?,
+    tx_bundle_id: parse_u16_from_dict(properties, "id")?,
+    bits_per_sample: parse_encoding(properties)?,
+    fpp,
+    min_rx_latency_ns: parse_latency_ns(properties)?,
+    media_addr: SocketAddr::V4(SocketAddrV4::new(ip, port)),
+  })
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
   use std::sync::atomic::{AtomicUsize, Ordering};
+
+  use rand::{rngs::SmallRng, Rng, SeedableRng};
+
+  fn props(entries: &[(&str, &str)]) -> TxtEntries {
+    entries.iter().map(|&(k, v)| (k.to_owned(), v.to_owned())).collect()
+  }
+
+  fn chan_props() -> TxtEntries {
+    props(&[
+      ("txtvers", "2"),
+      ("dbcp1", "0x1102"),
+      ("id", "3"),
+      ("rate", "48000"),
+      ("enc", "24"),
+      ("en", "24"),
+      ("latency_ns", "1000000"),
+      ("fpp", "192,16"),
+      ("nchan", "8"),
+    ])
+  }
+
+  fn bund_props() -> TxtEntries {
+    props(&[
+      ("id", "1"),
+      ("nchan", "2"),
+      ("latency_ns", "1000000"),
+      ("fpp", "48"),
+      ("enc", "24"),
+      ("a.0", "239.69.1.2"),
+      ("p.0", "4321"),
+    ])
+  }
+
+  fn addr() -> SocketAddr {
+    SocketAddr::new(Ipv4Addr::new(192, 168, 1, 10).into(), 4440)
+  }
+
+  /// What the subscriber relies on after a record was accepted.
+  fn assert_channel_sane(c: &AdvertisedChannel) {
+    assert!((1..=MAX_ADVERTISED_CHANNELS_PER_FLOW).contains(&c.tx_channels_per_flow), "{c:?}");
+    assert!([16, 24, 32].contains(&c.bits_per_sample), "{c:?}");
+    assert!(c.fpp_max >= 1, "{c:?}");
+    assert!(c.min_rx_latency_ns <= MAX_ADVERTISED_LATENCY_NS, "{c:?}");
+  }
+
+  fn assert_bundle_sane(b: &AdvertisedBundle) {
+    assert!((1..=MAX_ADVERTISED_CHANNELS_PER_FLOW).contains(&b.tx_channels_per_flow), "{b:?}");
+    assert!([16, 24, 32].contains(&b.bits_per_sample), "{b:?}");
+    assert!(b.fpp >= 1, "{b:?}");
+    assert!(b.min_rx_latency_ns <= MAX_ADVERTISED_LATENCY_NS, "{b:?}");
+    assert!(b.media_addr.ip().is_multicast() && b.media_addr.port() != 0, "{b:?}");
+  }
+
+  #[test]
+  fn a_good_channel_record_is_accepted() {
+    let c = parse_channel_properties(addr(), "host", &chan_props()).unwrap();
+    assert_eq!((c.tx_channels_per_flow, c.tx_channel_id, c.bits_per_sample), (8, 3, 24));
+    assert_eq!((c.dbcp1, c.fpp_max, c.fpp_min, c.min_rx_latency_ns), (0x1102, 192, 16, 1_000_000));
+    assert!(c.multicast.is_none());
+    let mut p = chan_props();
+    p.insert("b.7".into(), "2".into());
+    let m = parse_channel_properties(addr(), "host", &p).unwrap().multicast.unwrap();
+    assert_eq!((m.bundle_id, m.channel_in_bundle), (7, 1));
+  }
+
+  #[test]
+  fn a_good_bundle_record_is_accepted() {
+    let b = parse_bundle_properties(&bund_props()).unwrap();
+    assert_eq!((b.tx_channels_per_flow, b.tx_bundle_id, b.bits_per_sample, b.fpp), (2, 1, 24, 48));
+    assert_eq!(b.media_addr, "239.69.1.2:4321".parse().unwrap());
+  }
+
+  #[test]
+  fn values_the_receiver_cannot_handle_are_refused() {
+    // (key, value) pairs that used to reach the subscriber and panic it (chunks(0), division by zero,
+    // assert on the sample size, unsupported bytes per sample) or allocate without bound.
+    for (key, value) in [
+      ("nchan", "0"),
+      ("nchan", "65"),
+      ("nchan", "4000000000"),
+      ("enc", "0"),
+      ("enc", "4"),
+      ("enc", "12"),
+      ("enc", "40"),
+      ("id", "70000"),
+      ("dbcp1", "0x10000"),
+      ("fpp", "0,16"),
+      ("fpp", "192"),
+      ("fpp", "70000,16"),
+      ("latency_ns", "18446744073709551615"),
+    ] {
+      let mut p = chan_props();
+      p.insert(key.into(), value.into());
+      if key == "enc" {
+        p.insert("en".into(), value.into());
+      }
+      assert!(parse_channel_properties(addr(), "host", &p).is_err(), "{key}={value}");
+    }
+    for (key, value) in [
+      ("nchan", "0"),
+      ("nchan", "100000000000"),
+      ("enc", "0"),
+      ("fpp", "0"),
+      ("a.0", "192.168.1.1"),
+      ("a.0", "ff02::1"),
+      ("p.0", "0"),
+      ("p.0", "65536"),
+      ("latency_ns", "99999999999999999999"),
+    ] {
+      let mut p = bund_props();
+      p.insert(key.into(), value.into());
+      assert!(parse_bundle_properties(&p).is_err(), "{key}={value}");
+    }
+  }
+
+  #[test]
+  fn a_record_missing_any_key_is_an_error_not_a_panic() {
+    for key in chan_props().keys() {
+      let mut p = chan_props();
+      p.remove(key);
+      if let Ok(c) = parse_channel_properties(addr(), "host", &p) {
+        assert_channel_sane(&c); // optional keys (txtvers, rate, en) may be absent
+      }
+    }
+    for key in bund_props().keys() {
+      let mut p = bund_props();
+      p.remove(key);
+      assert!(parse_bundle_properties(&p).is_err(), "{key}");
+    }
+    assert!(parse_channel_properties(addr(), "host", &TxtEntries::new()).is_err());
+    assert!(parse_bundle_properties(&TxtEntries::new()).is_err());
+  }
+
+  /// A random string: mostly digits and the separators the parsers split on, sometimes arbitrary
+  /// (including multi-byte) characters.
+  fn random_value(rng: &mut SmallRng) -> String {
+    #[rustfmt::skip]
+    const POOL: &[&str] = &[
+      "0", "1", "2", "8", "16", "24", "32", "48", "192", "255", "65535", "65536", "0x", "0x1102", "0xzz", "-1",
+      ",", "192,16", ",,", "239.1.2.3", "224.0.0.251", "::1", "é", "日本", "", " ", "99999999999999999999999",
+      "4294967296",
+    ];
+    if rng.gen_bool(0.7) {
+      POOL[rng.gen_range(0..POOL.len())].to_owned()
+    } else {
+      (0..rng.gen_range(0..12)).map(|_| char::from_u32(rng.gen_range(0..0x3000)).unwrap_or('?')).collect()
+    }
+  }
+
+  #[test]
+  fn random_mutations_of_a_record_never_panic_and_accepted_records_are_sane() {
+    let mut rng = SmallRng::seed_from_u64(0x1337_0092);
+    let (mut accepted_chan, mut accepted_bund) = (0, 0);
+    for _ in 0..20_000 {
+      let mut p = chan_props();
+      let mut b = bund_props();
+      p.insert("b.1".into(), "1".into());
+      for _ in 0..rng.gen_range(1..4) {
+        let target = if rng.gen_bool(0.5) { &mut p } else { &mut b };
+        let keys: Vec<String> = target.keys().cloned().collect();
+        let key = keys[rng.gen_range(0..keys.len())].clone();
+        match rng.gen_range(0..4) {
+          0 => {
+            target.remove(&key);
+          }
+          1 => {
+            target.insert(key, random_value(&mut rng));
+          }
+          2 => {
+            target.insert(random_value(&mut rng), random_value(&mut rng));
+          }
+          _ => {
+            // truncate the value
+            let v = target[&key].clone();
+            let cut = rng.gen_range(0..=v.chars().count());
+            target.insert(key, v.chars().take(cut).collect());
+          }
+        }
+      }
+      if let Ok(c) = parse_channel_properties(addr(), "host", &p) {
+        assert_channel_sane(&c);
+        accepted_chan += 1;
+      }
+      if let Ok(bundle) = parse_bundle_properties(&b) {
+        assert_bundle_sane(&bundle);
+        accepted_bund += 1;
+      }
+    }
+    // the fuzzer must exercise both outcomes
+    assert!(accepted_chan > 100 && accepted_bund > 100, "{accepted_chan} {accepted_bund}");
+  }
 
   #[tokio::test]
   async fn retransmits_until_an_attempt_succeeds() {
