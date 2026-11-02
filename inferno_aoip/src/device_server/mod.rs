@@ -184,9 +184,12 @@ impl DeviceServer {
 
     let mdns_server = mdns_handle.clone();
     let shutdown_todo = async move {
-      shutdown_send.send(()).unwrap();
+      // Fails only when every task has already ended.
+      let _ = shutdown_send.send(());
       for task in tasks {
-        task.await.unwrap();
+        if let Err(e) = task.await {
+          error!("a common task ended abnormally: {e}");
+        }
       }
       mdns_handle.shutdown_and_join();
     }
@@ -312,7 +315,9 @@ impl DeviceServer {
       channels_sub_handle.shutdown().await;
       join_without_blocking(flows_rx_thread).await;
       for task in tasks {
-        task.await.unwrap();
+        if let Err(e) = task.await {
+          error!("a receiver task ended abnormally: {e}");
+        }
       }
       info!("receiver stopped");
     }
@@ -321,7 +326,9 @@ impl DeviceServer {
   }
   pub async fn stop_receiver(&mut self) {
     let _ = self.channels_sub_tx.send(None);
-    self.rx_shutdown_todo.take().unwrap().await;
+    if let Some(shutdown) = self.rx_shutdown_todo.take() {
+      shutdown.await;
+    }
   }
 
   pub async fn transmit_from_external_buffer(
@@ -408,8 +415,10 @@ impl DeviceServer {
         if let Some(txm) = tx_multicasts.lock().await.take() {
           txm.shutdown().await;
         }
-        shutdown_send.send(()).unwrap();
-        flows_control_task.await.unwrap();
+        let _ = shutdown_send.send(());
+        if let Err(e) = flows_control_task.await {
+          error!("the flows control task ended abnormally: {e}");
+        }
         *flows_tx.lock().await = None;
         join_without_blocking(flows_tx_thread).await;
         //peaks_thread.join().unwrap();
@@ -419,7 +428,9 @@ impl DeviceServer {
     );
   }
   pub async fn stop_transmitter(&mut self) {
-    self.tx_shutdown_todo.take().unwrap().await;
+    if let Some(shutdown) = self.tx_shutdown_todo.take() {
+      shutdown.await;
+    }
   }
 
   pub async fn subscribe(&self, local_channel_index: usize, tx_channel_name: &str, tx_hostname: &str) {
