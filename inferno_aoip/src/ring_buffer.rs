@@ -235,7 +235,13 @@ impl<T: Default + NoUninit, P: ProxyToBuffer<Atomic<T>>> RBInput<T, P> {
     mut input: impl ExactSizeIterator<Item = T>,
   ) -> usize {
     let input_len = input.len();
-    assert!(input_len < self.rb.items_size);
+    if input_len >= self.rb.items_size {
+      // ONS fork (issue #92): upstream asserted. The length comes from a received packet, so a buffer
+      // smaller than a packet must not take the receiver thread down: drop the write, which leaves a
+      // hole that the following writes close.
+      error!("dropping a write of {input_len} items into a ring buffer of {} items", self.rb.items_size);
+      return self.rb.readable_pos.load(Ordering::Relaxed);
+    }
 
     // Do we have a new hole?
     let mut hole = wrapsub(start_timestamp, self.rb.writing_pos.load(Ordering::Relaxed)) > 0;
@@ -266,7 +272,8 @@ impl<T: Default + NoUninit, P: ProxyToBuffer<Atomic<T>>> RBInput<T, P> {
     self.rb.buffer.map(|buffer| {
       for_in_ring(self.rb.items_size, start_timestamp, end_ts, |i| {
         //debug!("writing to RB index {i}");
-        buffer[i * self.rb.stride].store(input.next().unwrap(), Ordering::Relaxed);
+        // (the range holds exactly `input_len` items, so the default is never used)
+        buffer[i * self.rb.stride].store(input.next().unwrap_or_default(), Ordering::Relaxed);
         self.item_ready.set(i, true);
       });
       atomic::fence(Ordering::Release); // TODO: really needed? won't readable_pos.store(Ordering::Release) suffice?
@@ -300,7 +307,7 @@ impl<T: Default + NoUninit, P: ProxyToBuffer<Atomic<T>>> RBInput<T, P> {
           self.rb.readable_pos.load(Ordering::Relaxed),
           close_until_pos,
           |i| {
-            if !self.item_ready.get(i).unwrap() {
+            if !self.item_ready.get(i).unwrap_or(false) {
               hole = true;
               buffer[i * self.rb.stride].store(T::default(), Ordering::Relaxed);
               self.item_ready.set(i, true);
@@ -327,7 +334,7 @@ impl<T: Default + NoUninit, P: ProxyToBuffer<Atomic<T>>> RBInput<T, P> {
           if !ready {
             return;
           }
-          if self.item_ready.get(i).unwrap() {
+          if self.item_ready.get(i).unwrap_or(false) {
             new_readable_pos += 1;
           } else {
             ready = false;
@@ -402,7 +409,7 @@ impl<T: NoUninit, P: ProxyToBuffer<Atomic<T>>> RBOutput<T, P> {
       output.len()
     } else {
       let readable = wrapsub(self.rb.readable_pos.load(Ordering::Acquire), start_timestamp);
-      if readable < 0 || readable > self.rb.items_size.try_into().unwrap() {
+      if readable < 0 || readable > isize::try_from(self.rb.items_size).unwrap_or(isize::MAX) {
         debug!("readable {readable}, items_size {}", self.rb.items_size);
         // we're trying to read not yet written data, or we're lagging behind so much that data at that timestamp has already been overwritten
         return ReadResult { useful_start_index: 0, useful_end_index: 0 };
@@ -440,7 +447,7 @@ impl<T: NoUninit, P: ProxyToBuffer<Atomic<T>>> RBOutput<T, P> {
     if !self.rb.buffer.unconditional_read() {
       let writing_pos = self.rb.writing_pos.load(Ordering::SeqCst);
       let diff = wrapsub(writing_pos, start_timestamp);
-      if diff > self.rb.items_size.try_into().unwrap() {
+      if diff > isize::try_from(self.rb.items_size).unwrap_or(isize::MAX) {
         // data has been overwritten in the meantime, so some data at the beginning of the buffer may be wrong
         let overwritten = diff as usize - self.rb.items_size;
         return ReadResult {
@@ -1167,5 +1174,69 @@ mod tests {
       .chain(70..74)
       .collect();
     assert_eq!(buf3, expected);
+  }
+}
+
+/// ONS fork (issue #92): the ring buffer is driven by packet contents (timestamps and lengths), so no
+/// sequence of calls may panic it.
+#[cfg(test)]
+mod no_panic_tests {
+  use super::*;
+  use rand::{rngs::SmallRng, Rng, SeedableRng};
+
+  #[test]
+  fn a_write_longer_than_the_buffer_is_dropped_not_fatal() {
+    let (mut input, output) = new_owned(16, 0, 100);
+    // exactly the size and far beyond it
+    assert_eq!(input.write_from_at(0, (0..16).map(|x| x as i32)), 0);
+    assert_eq!(input.write_from_at(0, (0..1000).map(|x| x as i32)), 0);
+    assert_eq!(output.readable_until(), 0);
+    // the buffer still works afterwards
+    assert_eq!(input.write_from_at(0, (0..4).map(|x| x as i32)), 4);
+    let mut read = vec![0; 4];
+    assert_eq!(output.read_at(0, &mut read), ReadResult { useful_start_index: 0, useful_end_index: 4 });
+    assert_eq!(read, vec![0, 1, 2, 3]);
+  }
+
+  #[test]
+  fn random_writes_reads_and_closes_never_panic() {
+    for (seed, size) in [(1u64, 16usize), (2, 64), (3, 1024)] {
+      let mut rng = SmallRng::seed_from_u64(seed);
+      // start close to the wrap point so that positions wrap during the run
+      let start = usize::MAX - rng.gen_range(0..64);
+      let (mut input, output) = new_owned::<i32>(size, start, rng.gen_range(0..size * 2));
+      let mut pos = start;
+      for _ in 0..20_000 {
+        match rng.gen_range(0..4) {
+          0 | 1 => {
+            // a packet: usually next in sequence, sometimes late, early (a hole) or absurd
+            let ts = match rng.gen_range(0..6) {
+              0 => pos.wrapping_sub(rng.gen_range(0..size * 3)),
+              1 => pos.wrapping_add(rng.gen_range(0..size * 3)),
+              2 => rng.gen(),
+              _ => pos,
+            };
+            let len = rng.gen_range(0..size * 2);
+            let readable = input.write_from_at(ts, (0..len).map(|x| x as i32));
+            if len < size {
+              pos = ts.wrapping_add(len);
+            }
+            let _ = readable;
+          }
+          2 => {
+            let mut out = vec![0; rng.gen_range(0..size * 2)];
+            let at =
+              if rng.gen_bool(0.5) { pos.wrapping_sub(rng.gen_range(0..size * 2)) } else { rng.gen() };
+            let r = output.read_at(at, &mut out);
+            assert!(
+              r.useful_start_index <= r.useful_end_index && r.useful_end_index <= out.len(),
+              "{r:?}"
+            );
+          }
+          _ => input.close_items_until(pos.wrapping_add(rng.gen_range(0..size * 3))),
+        }
+        let _ = (output.readable_until(), output.holes_count());
+      }
+    }
   }
 }

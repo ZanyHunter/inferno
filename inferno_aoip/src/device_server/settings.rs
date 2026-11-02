@@ -611,12 +611,14 @@ impl SettingsBuilder {
     };
 
     let friendly_hostname = match (&self.device_name, self.legacy) {
-      (Some(name), true) => truncate_chars(name, MAX_DEVICE_NAME_LEN).to_owned(),
+      // (ONS fork: an empty legacy name, `INFERNO_NAME=` for example, is no name: it cannot be
+      // advertised, so the default name is used)
+      (Some(name), true) if !name.is_empty() => truncate_chars(name, MAX_DEVICE_NAME_LEN).to_owned(),
       (Some(name), false) => {
         validate_device_name(name)?;
         name.clone()
       }
-      (None, true) => {
+      (None, true) | (Some(_), true) => {
         format!("{} {}", truncate_chars(&self.app_name, 22), hex::encode(nic.ipv4.octets()))
       }
       (None, false) => {
@@ -633,8 +635,8 @@ impl SettingsBuilder {
         validate_device_name(name)?;
         name.clone()
       }
-      (Some(name), true) => truncate_chars(name, MAX_DEVICE_NAME_LEN).to_owned(),
-      (None, _) => friendly_hostname.clone(),
+      (Some(name), true) if !name.is_empty() => truncate_chars(name, MAX_DEVICE_NAME_LEN).to_owned(),
+      (None, _) | (Some(_), true) => friendly_hostname.clone(),
     };
     let naming = DeviceNaming {
       default_name,
@@ -1252,5 +1254,58 @@ mod tests {
     let err =
       Settings::try_new("App", "App", Some(Ipv4Addr::LOCALHOST), &map(&[("ALT_PORT", "nope")])).err();
     assert!(matches!(err, Some(SettingsError::InvalidSetting { .. })));
+  }
+
+  #[test]
+  fn an_empty_legacy_name_means_the_default_name() {
+    let s = from_map(&[("NAME", "")], None).unwrap();
+    assert_eq!(s.self_info.friendly_hostname(), "App c0a83207");
+    assert_eq!(s.naming.default_name, s.self_info.friendly_hostname());
+  }
+
+  /// Settings come from files, environment variables and the host's UI: whatever they hold, building
+  /// them returns a value or an error and never panics (ONS fork, issue #92).
+  #[test]
+  fn random_config_maps_never_panic_the_builder() {
+    use rand::{rngs::SmallRng, Rng, SeedableRng};
+    #[rustfmt::skip]
+    const KEYS: &[&str] = &[
+      "NAME", "PROCESS_ID", "DEVICE_ID", "SAMPLE_RATE", "RX_LATENCY_NS", "TX_LATENCY_NS", "ALT_PORT",
+      "RX_CHANNELS", "TX_CHANNELS", "CLOCK_PATH", "USE_SAFE_CLOCK", "TX_SOURCE_BIT_DEPTH", "STATE_DIR", "BIND_IP",
+      "UNKNOWN",
+    ];
+    #[rustfmt::skip]
+    const VALUES: &[&str] = &[
+      "", " ", "0", "1", "2", "8", "16", "24", "32", "255", "256", "4800", "44100", "48000", "65535", "65536",
+      "4294967295", "4294967296", "18446744073709551615", "99999999999999999999", "-1", "true", "false", "yes",
+      "0x10", "001dc1aabbcc0000", "001dc1aabbcc00", "zz", "127.0.0.1", "0.0.0.0", "999.1.1.1", "Ethernet 2",
+      "My-Device", "-bad-", "name with spaces", "日本語", "a.b", "../..", "C:\\x", "/tmp/clk",
+    ];
+    let mut rng = SmallRng::seed_from_u64(0x92_5e77);
+    let (mut ok, mut err) = (0, 0);
+    for _ in 0..5000 {
+      let mut pairs = vec![];
+      for _ in 0..rng.gen_range(0..6) {
+        let value = if rng.gen_bool(0.85) {
+          VALUES[rng.gen_range(0..VALUES.len())].to_owned()
+        } else {
+          (0..rng.gen_range(0..80))
+            .map(|_| char::from_u32(rng.gen_range(0..0x400)).unwrap_or('?'))
+            .collect()
+        };
+        pairs.push((KEYS[rng.gen_range(0..KEYS.len())], value));
+      }
+      let pairs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+      let my_ip = rng.gen_bool(0.2).then(|| Ipv4Addr::new(192, 168, 50, 7));
+      match from_map(&pairs, my_ip) {
+        Ok(s) => {
+          ok += 1;
+          // what a built device promises its consumers
+          assert!(!s.self_info.friendly_hostname().is_empty(), "{pairs:?}");
+        }
+        Err(_) => err += 1,
+      }
+    }
+    assert!(ok > 50 && err > 50, "ok {ok}, err {err}");
   }
 }
