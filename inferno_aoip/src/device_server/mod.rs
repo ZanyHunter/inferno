@@ -70,6 +70,16 @@ async fn join_without_blocking(thread: std::thread::JoinHandle<()>) {
   }
 }
 
+/// Why [`DeviceServer::try_start_with_clock`] could not start the device. ONS fork (issue #92): upstream
+/// panicked. The usual cause on a laptop or after a NIC change is that the configured address is not
+/// assigned to any interface (any more).
+#[derive(Debug, thiserror::Error)]
+pub enum StartError {
+  /// The mDNS responder could not be started on the NIC.
+  #[error("the mDNS responder could not be started: {0}")]
+  Mdns(String),
+}
+
 pub struct TransferNotifier {
   pub callback: Box<dyn Fn() + Send + Sync>,
   pub max_interval_samples: Clock,
@@ -111,7 +121,23 @@ impl DeviceServer {
   /// [`ClockPublisher`]: the host publishes [`ClockOverlay`]s into it (ONS: converted from the ons-ptp
   /// media clock), on every platform and with no socket. With `None` it behaves like
   /// [`DeviceServer::start`].
+  ///
+  /// # Panics
+  ///
+  /// When the device cannot be started (see [`StartError`]). Upstream-compatible; a host that has to
+  /// survive a network change (the NIC's address is gone) uses [`DeviceServer::try_start_with_clock`].
   pub async fn start_with_clock(settings: settings::Settings, clock: Option<ClockPublisher>) -> Self {
+    match Self::try_start_with_clock(settings, clock).await {
+      Ok(server) => server,
+      Err(e) => panic!("cannot start the Inferno device server: {e}"),
+    }
+  }
+
+  /// [`DeviceServer::start_with_clock`] that reports a failure to start instead of panicking.
+  pub async fn try_start_with_clock(
+    settings: settings::Settings,
+    clock: Option<ClockPublisher>,
+  ) -> Result<Self, StartError> {
     let self_info = Arc::new(settings.self_info);
     let state_storage = Arc::new(StateStorage::new(&self_info, &settings.state_dir));
     // A name saved by an earlier rename wins over the configured one; it has to be in place before
@@ -123,10 +149,10 @@ impl DeviceServer {
     let shdn_recv2 = shutdown_send.subscribe();
     let shdn_recv3 = shutdown_send.subscribe();
     let tx_multicasts_by_channel: Arc<RwLock<BTreeMap<usize, PointerToMulticast>>> = Default::default();
-    let mdns_handle = Arc::new(mdns_server::DeviceMDNSResponder::start(
-      self_info.clone(),
-      tx_multicasts_by_channel.clone(),
-    ));
+    let mdns_handle = Arc::new(
+      mdns_server::DeviceMDNSResponder::start(self_info.clone(), tx_multicasts_by_channel.clone())
+        .map_err(StartError::Mdns)?,
+    );
 
     let mdns_client = Arc::new(crate::mdns_client::MdnsClient::new(self_info.clone()));
     let (mcast_tx, mcast_rx) = mpsc::channel(100);
@@ -195,7 +221,7 @@ impl DeviceServer {
     }
     .boxed();
 
-    Self {
+    Ok(Self {
       self_info,
       ref_instant,
       state_storage,
@@ -226,7 +252,7 @@ impl DeviceServer {
       shutdown_todo,
       rx_shutdown_todo: None,
       tx_shutdown_todo: None,
-    }
+    })
   }
 
   pub async fn receive_with_callback(&mut self, samples_callback: SamplesCallback) {
