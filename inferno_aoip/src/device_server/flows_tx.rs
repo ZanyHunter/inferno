@@ -3,6 +3,7 @@ use std::num::Wrapping;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
+use std::time::Instant;
 use std::{collections::BTreeMap, net::SocketAddr, sync::atomic::AtomicU32, time::Duration};
 
 use atomic::Ordering;
@@ -16,7 +17,7 @@ use tokio::{select, sync::mpsc};
 use super::samples_utils::*;
 use super::tx_multicasts::MEDIA_PORT;
 use crate::device_server::TransferNotifier;
-use crate::media_clock::async_clock_receiver_to_realtime;
+use crate::media_clock::{async_clock_receiver_to_realtime, ClockStatusHandle};
 use crate::ring_buffer::{ProxyToSamplesBuffer, RBOutput};
 use crate::util::os::set_current_thread_realtime;
 use crate::util::real_time_box_channel::RealTimeBoxReceiver;
@@ -44,6 +45,12 @@ pub const MIN_SLEEP: Duration = Duration::from_millis(0); // to save CPU cycles,
 /// media clock again. The media clock can step (a PTP lock moves it by an arbitrary amount), and a wait
 /// computed from the old clock must not outlive the step.
 pub const MAX_IDLE_SLEEP: Duration = Duration::from_millis(250);
+
+/// ONS fork: how long a followed clock leader has to be reported without a break before the transmitter
+/// starts sending (see [`FlowsTransmitterInternal::gate_allows`]). The host publishes the clock map first
+/// and the leader status right after, and the media clock reaches this thread through two more hops, so
+/// the leader can be reported a moment before our media clock is on its timeline.
+pub const LEADER_SETTLE: Duration = Duration::from_millis(150);
 
 // it's better to have the clock in the past than in the future - otherwise Dante devices receiving from us go mad and fart
 const CLOCK_OFFSET_NS: ClockDiff = -500_000;
@@ -112,6 +119,15 @@ struct FlowsTransmitterInternal<P: ProxyToSamplesBuffer> {
   current_timestamp: Arc<AtomicUsize>,
   on_transfer: Option<TransferNotifier>,
   //callback: SamplesRequestCallback,
+  /// ONS fork: when set, flows only transmit while the host reports a followed clock leader (see
+  /// [`FlowsTransmitterInternal::gate_allows`]). `None` keeps the upstream behaviour: transmit as soon as
+  /// the media clock is ready.
+  leader_gate: Option<ClockStatusHandle>,
+  /// False while the gate holds transmission back. Always true without a gate.
+  gate_open: bool,
+  /// Since when the gate has seen a leader without a break.
+  leader_since: Option<Instant>,
+  leader_settle: Duration,
 }
 
 impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
@@ -144,6 +160,45 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
     }
   }
 
+  /// ONS fork: whether flows may transmit now.
+  ///
+  /// A transmitter that has not synchronised to a clock leader stamps its packets with its own free-running
+  /// clock. Receivers cannot play those (the leader's timeline is a different epoch), and a Dante
+  /// controller shows the subscription as healthy meanwhile. So with a gate the transmitter stays silent
+  /// until the host reports a followed leader that has been stable for [`LEADER_SETTLE`], and goes silent
+  /// again when the leader is lost.
+  ///
+  /// When the gate opens, every flow is re-seeded on the current media clock and its keepalive deadline is
+  /// refreshed: flows can have been created while the gate was shut (or on the old timeline).
+  fn gate_allows(&mut self, now: LongClock) -> bool {
+    let Some(gate) = &self.leader_gate else {
+      return true;
+    };
+    if gate.get().master_clock_id.is_none() {
+      if self.gate_open {
+        warn!("tx: clock leader lost, no longer transmitting");
+      }
+      self.gate_open = false;
+      self.leader_since = None;
+      return false;
+    }
+    if self.gate_open {
+      return true;
+    }
+    let since = *self.leader_since.get_or_insert_with(Instant::now);
+    if since.elapsed() < self.leader_settle {
+      return false;
+    }
+    let sample_rate = self.sample_rate;
+    for flow in self.flows.iter_mut().filter_map(|opt| opt.as_mut()) {
+      flow.bootstrap_next_ts(now);
+      flow.keep_alive(now as Clock, sample_rate);
+    }
+    self.gate_open = true;
+    info!("tx: following a clock leader, transmitting");
+    true
+  }
+
   #[inline(always)]
   fn transmit(&mut self, dither_rng: &mut SmallRng, now: LongClock, process_events: bool) {
     let mut tmp_samples = [0 as Sample; FPP_MAX as usize];
@@ -153,6 +208,9 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
     let max_lag_samples = self.max_lag_samples;
     let mut iterations = 0;
     let mut max_missing_samples = 0;
+    if !self.gate_allows(now) {
+      return;
+    }
     let dither_16 = self.should_dither(16);
     let dither_24 = self.should_dither(24);
     for flow in &mut self.flows.iter_mut().filter_map(|opt| opt.as_mut()) {
@@ -304,11 +362,13 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
       if self.stop.load(Ordering::Acquire) {
         break;
       }
+      // ONS fork: a closed gate has nothing to wait for; the wait is the idle sleep, after which
+      // `transmit` looks at the gate again. (Waiting for stale timestamps would spin.)
       let min_next_ts = self
         .flows
         .iter()
         .filter_map(|opt| opt.as_ref())
-        .filter(|flow| !flow.expired.load(Ordering::Relaxed))
+        .filter(|flow| self.gate_open && !flow.expired.load(Ordering::Relaxed))
         .map(|&ref flow| flow.next_ts as Clock)
         .min_by(|&a, &b| wrapped_diff(a, b).cmp(&0));
 
@@ -521,6 +581,7 @@ impl FlowsTransmitter {
     start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
     current_timestamp: Arc<AtomicUsize>,
     on_transfer: Option<TransferNotifier>,
+    leader_gate: Option<ClockStatusHandle>,
   ) {
     let latency: u32 = (latency_ns as u64 * sample_rate as u64 / 1_000_000_000u64).try_into().unwrap();
     let mut internal = FlowsTransmitterInternal {
@@ -540,6 +601,10 @@ impl FlowsTransmitter {
         .unwrap(),
       current_timestamp,
       on_transfer,
+      gate_open: leader_gate.is_none(),
+      leader_gate,
+      leader_since: None,
+      leader_settle: LEADER_SETTLE,
     };
     internal.run(start_time_rx).await;
   }
@@ -552,6 +617,7 @@ impl FlowsTransmitter {
     start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
     current_timestamp: Arc<AtomicUsize>,
     on_transfer: Option<TransferNotifier>,
+    leader_gate: Option<ClockStatusHandle>,
   ) -> (Self, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(100);
     let tx1 = tx.clone();
@@ -573,6 +639,7 @@ impl FlowsTransmitter {
         start_time_rx,
         current_timestamp,
         on_transfer,
+        leader_gate,
       )
       .boxed_local()
     });
@@ -781,5 +848,172 @@ impl FlowsTransmitter {
   }
   pub fn get_flows_info(&self) -> &Vec<Option<FlowInfo>> {
     &self.flows_info
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::media_clock::HostClockStatus;
+  use crate::ring_buffer::{new_owned, OwnedBuffer};
+  use atomic::Atomic;
+
+  type Internal = FlowsTransmitterInternal<OwnedBuffer<Atomic<Sample>>>;
+
+  const RATE: u32 = 48000;
+  /// Media time of a made-up leader that is far ahead of this machine's own clock.
+  const LEADER_A_NS: i64 = 1_700_000_000_000_000_000;
+  const LEADER_B_NS: i64 = 1_800_000_000_000_000_000;
+  /// The overlay adds the leader time to this host's own clock (its uptime), so allow for that.
+  const UPTIME_SLACK_S: u32 = 50_000_000;
+
+  fn overlay(shift: i64) -> ClockOverlay {
+    ClockOverlay { clock_id: 1, last_sync: 0, shift, freq_scale: 0.0 }
+  }
+
+  fn leader() -> HostClockStatus {
+    HostClockStatus { master_clock_id: Some([0, 0x1d, 0xc1, 0x20, 0x51, 0xf0, 0, 0]), locked: false }
+  }
+
+  /// A transmitter state with two silent channels and a media clock on this machine's own timeline
+  /// (`shift` 0). The command queue and the clock channel are not used: the tests drive `transmit` and
+  /// set the clock directly.
+  fn internal(gate: Option<ClockStatusHandle>) -> Internal {
+    let sources = (0..2).map(|_| new_owned::<Sample>(1 << 16, 0, 0).1).collect_vec();
+    let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (_clock_tx, clock_recv) = crate::util::real_time_box_channel::channel(Box::new(None));
+    let mut clock = MediaClock::new(false);
+    clock.update_overlay(overlay(0));
+    FlowsTransmitterInternal {
+      commands_receiver: cmd_rx,
+      stop: Arc::new(AtomicBool::new(false)),
+      clock_recv,
+      sample_rate: RATE,
+      flows: (0..MAX_FLOWS).map(|_| None).collect_vec(),
+      clock,
+      channels_sources: sources,
+      send_latency_samples: 0,
+      clock_offset_samples: 0,
+      max_lag_samples: RATE as usize,
+      timestamp_shift: 0,
+      tx_source_bit_depth: 32,
+      current_timestamp: Arc::new(AtomicUsize::new(usize::MAX)),
+      on_transfer: None,
+      gate_open: gate.is_none(),
+      leader_gate: gate,
+      leader_since: None,
+      leader_settle: Duration::from_millis(40),
+    }
+  }
+
+  /// Puts a 2 channel, 48 frames per packet flow into slot `index` and returns the socket that receives
+  /// its packets.
+  fn add_flow(t: &mut Internal, index: usize, keepalives: bool) -> UdpSocket {
+    let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+    rx.set_nonblocking(true).unwrap();
+    let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+    tx.connect(rx.local_addr().unwrap()).unwrap();
+    tx.set_nonblocking(true).unwrap();
+    let mut flow = Flow {
+      socket: tx,
+      channel_indices: vec![Some(0), Some(1)],
+      next_ts: 0,
+      fpp: 48,
+      bytes_per_sample: 3,
+      expires: if keepalives { Some(0) } else { None },
+      expired: Arc::new(AtomicBool::new(false)),
+    };
+    let now = t.now().unwrap();
+    flow.bootstrap_next_ts(now);
+    if keepalives {
+      flow.keep_alive(now as Clock, RATE);
+    }
+    t.flows[index] = Some(flow);
+    rx
+  }
+
+  /// Media time, in whole seconds, of every packet waiting on `rx`.
+  fn packet_seconds(rx: &UdpSocket) -> Vec<u32> {
+    let mut seconds = vec![];
+    let mut buf = [0u8; 2048];
+    while let Ok(n) = rx.recv(&mut buf) {
+      assert!(n > 9);
+      seconds.push(u32::from_be_bytes(buf[1..5].try_into().unwrap()));
+    }
+    seconds
+  }
+
+  /// Runs the transmitter the way its thread does, about once a millisecond, for `duration`.
+  fn run_for(t: &mut Internal, duration: Duration) {
+    let mut rng = SmallRng::seed_from_u64(1);
+    let end = std::time::Instant::now() + duration;
+    while std::time::Instant::now() < end {
+      let now = t.now().unwrap();
+      t.transmit(&mut rng, now, false);
+      std::thread::sleep(Duration::from_millis(1));
+    }
+  }
+
+  #[test]
+  fn without_a_gate_it_transmits_as_soon_as_the_clock_is_ready() {
+    let mut t = internal(None);
+    let rx = add_flow(&mut t, 0, false);
+    run_for(&mut t, Duration::from_millis(60));
+    assert!(!packet_seconds(&rx).is_empty());
+  }
+
+  #[test]
+  fn with_a_gate_it_is_silent_until_a_leader_is_followed_and_then_stays_on_the_leaders_timeline() {
+    let status = ClockStatusHandle::new();
+    let mut t = internal(Some(status.clone()));
+    let rx = add_flow(&mut t, 0, true);
+
+    // No leader: the flow exists, the media clock runs on the local timeline, nothing may be sent.
+    run_for(&mut t, Duration::from_millis(80));
+    assert_eq!(packet_seconds(&rx), Vec::<u32>::new(), "sent without a leader");
+
+    // The leader appears and the clock steps to its timeline. The settle time still holds it back.
+    status.set(leader());
+    t.clock.update_overlay(overlay(LEADER_A_NS));
+    run_for(&mut t, Duration::from_millis(10));
+    assert_eq!(packet_seconds(&rx), Vec::<u32>::new(), "sent before the leader settled");
+
+    // Then it transmits, and every packet is on the leader's timeline (not the ~uptime of this host).
+    run_for(&mut t, Duration::from_millis(120));
+    let seconds = packet_seconds(&rx);
+    assert!(seconds.len() > 20, "{} packets", seconds.len());
+    let want = (LEADER_A_NS / 1_000_000_000) as u32;
+    assert!(seconds.iter().all(|s| (want..want + UPTIME_SLACK_S).contains(s)), "{seconds:?}");
+
+    // The leader is lost: silence, even though the clock keeps running.
+    status.set(HostClockStatus::default());
+    run_for(&mut t, Duration::from_millis(5));
+    packet_seconds(&rx);
+    run_for(&mut t, Duration::from_millis(80));
+    assert_eq!(packet_seconds(&rx), Vec::<u32>::new(), "kept sending after the leader was lost");
+
+    // A different leader on another timeline: the flow resumes there, nothing from the old one.
+    status.set(leader());
+    t.clock.update_overlay(overlay(LEADER_B_NS));
+    run_for(&mut t, Duration::from_millis(150));
+    let seconds = packet_seconds(&rx);
+    assert!(seconds.len() > 20, "{} packets", seconds.len());
+    let want = (LEADER_B_NS / 1_000_000_000) as u32;
+    assert!(seconds.iter().all(|s| (want..want + UPTIME_SLACK_S).contains(s)), "{seconds:?}");
+  }
+
+  #[test]
+  fn a_flow_added_while_the_gate_is_shut_starts_on_the_leaders_timeline() {
+    let status = ClockStatusHandle::new();
+    let mut t = internal(Some(status.clone()));
+    // Created on the local timeline, before there is a leader.
+    let rx = add_flow(&mut t, 3, true);
+    status.set(leader());
+    t.clock.update_overlay(overlay(LEADER_A_NS));
+    run_for(&mut t, Duration::from_millis(150));
+    let seconds = packet_seconds(&rx);
+    assert!(!seconds.is_empty());
+    let want = (LEADER_A_NS / 1_000_000_000) as u32;
+    assert!(seconds.iter().all(|s| (want..want + UPTIME_SLACK_S).contains(s)), "{seconds:?}");
   }
 }

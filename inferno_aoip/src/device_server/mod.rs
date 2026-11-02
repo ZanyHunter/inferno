@@ -85,6 +85,8 @@ pub struct DeviceServer {
   mdns_server: Arc<DeviceMDNSResponder>,
   mcast_tx: mpsc::Sender<crate::protocol::mcast::MulticastMessage>,
   tx_latency_ns: u32,
+  /// ONS fork: see `Settings::tx_requires_clock_leader`.
+  tx_leader_gate: Option<ClockStatusHandle>,
   tx_source_bit_depth: u8,
   channels_sub_tx: watch::Sender<Option<Arc<ChannelsSubscriber>>>,
   channels_subscriber: Option<Arc<ChannelsSubscriber>>,
@@ -200,6 +202,14 @@ impl DeviceServer {
       mdns_server,
       mcast_tx,
       tx_latency_ns: settings.tx_latency_ns,
+      tx_leader_gate: if settings.tx_requires_clock_leader {
+        if settings.clock_status.is_none() {
+          warn!("tx_requires_clock_leader needs a clock_status handle; transmitting without the gate");
+        }
+        settings.clock_status.clone()
+      } else {
+        None
+      },
       tx_source_bit_depth: settings.tx_source_bit_depth,
       channels_sub_tx,
       channels_subscriber: None,
@@ -345,6 +355,7 @@ impl DeviceServer {
       start_time_rx,
       current_timestamp.clone(),
       on_transfer,
+      self.tx_leader_gate.clone(),
     );
     *self.flows_tx.lock().await = Some(flows_tx_handle);
     let txm = TransmitMulticasts::new(
