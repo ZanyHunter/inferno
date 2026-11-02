@@ -405,42 +405,58 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
   async fn notify_channels_change(&self, channel_indices: impl IntoIterator<Item = usize>) {
     self.mcast.send(make_channel_change_notification(channel_indices)).await.log_and_forget();
   }
-  pub async fn unsubscribe(&mut self, local_channel_index: usize, remove_from_info: bool) {
-    if let Some(subscription) = &self.channels[local_channel_index] {
-      if let Some(remote) = subscription.remote.as_ref() {
-        self.channels_buffering.disconnect_channel(
-          local_channel_index,
-          remote.local_flow_index,
-          remote.channel_in_flow,
-          self.flows_recv.clone(),
-        );
-        match &mut self.flows.lock().unwrap()[remote.local_flow_index] {
-          Some(flow) => {
-            flow.channels_refcount[remote.channel_in_flow] -= 1;
-          }
-          None => {
-            error!("BUG: trying to unsubscribe channel from not existing flow");
-          }
+  /// Drops the channel's subscription and its flow reference without notifying anybody or saving.
+  /// Returns false if the channel was not subscribed.
+  fn detach_channel(&mut self, local_channel_index: usize, remove_from_info: bool) -> bool {
+    let Some(subscription) = &self.channels[local_channel_index] else {
+      return false;
+    };
+    if let Some(remote) = subscription.remote.as_ref() {
+      self.channels_buffering.disconnect_channel(
+        local_channel_index,
+        remote.local_flow_index,
+        remote.channel_in_flow,
+        self.flows_recv.clone(),
+      );
+      match &mut self.flows.lock().unwrap()[remote.local_flow_index] {
+        Some(flow) => {
+          flow.channels_refcount[remote.channel_in_flow] -= 1;
+        }
+        None => {
+          error!("BUG: trying to unsubscribe channel from not existing flow");
         }
       }
-      self.channels[local_channel_index] = None;
+    }
+    self.channels[local_channel_index] = None;
+    if remove_from_info {
+      self.subscriptions_info.write().unwrap()[local_channel_index] = None;
+    }
+    true
+  }
+  /// `remove_from_info` is true for a removal asked for by a controller: the state file is then
+  /// rewritten before anything else is awaited. ONS fork (issue #138): upstream saved after the whole
+  /// batch of commands, so a removal could still be unsaved when the process was stopped abruptly,
+  /// and the next start restored the subscription.
+  pub async fn unsubscribe(&mut self, local_channel_index: usize, remove_from_info: bool) {
+    if self.detach_channel(local_channel_index, remove_from_info) {
       if remove_from_info {
-        self.subscriptions_info.write().unwrap()[local_channel_index] = None;
+        self.save_state();
       }
       self.notify_channels_change([local_channel_index]).await;
     } else {
       error!("BUG: trying to unsubscribe not subscribed channel index {local_channel_index}");
     }
   }
+  /// `persist` is false while the saved state is being loaded (saving then would overwrite it with
+  /// the channels loaded so far).
   pub async fn subscribe(
     &mut self,
     local_channel_index: usize,
     tx_channel_name: &str,
     tx_hostname: &str,
+    persist: bool,
   ) {
-    if self.channels[local_channel_index].is_some() {
-      self.unsubscribe(local_channel_index, false).await;
-    }
+    let replaced = self.detach_channel(local_channel_index, false);
     self.channels[local_channel_index] = Some(ChannelSubscription {
       tx_channel_name: tx_channel_name.to_owned(),
       tx_hostname: tx_hostname.to_owned(),
@@ -448,6 +464,12 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
     });
     self.needs_resolving = true;
     self.resolve_now = true;
+    if persist {
+      self.save_state();
+    }
+    if replaced {
+      self.notify_channels_change([local_channel_index]).await;
+    }
   }
 
   pub async fn resolve_subscriptions(&mut self) -> bool {
@@ -1212,12 +1234,12 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
     match command {
       Command::Shutdown => return false,
       Command::Subscribe { local_channel_index, tx_channel_name, tx_hostname } => {
-        self.subscribe(local_channel_index, &tx_channel_name, &tx_hostname).await;
+        self.subscribe(local_channel_index, &tx_channel_name, &tx_hostname, true).await;
       }
       Command::Unsubscribe { local_channel_index } => {
         self.unsubscribe(local_channel_index, true).await;
       }
-      Command::ForceRefresh => {}
+      Command::ForceRefresh => self.save_state(),
     };
     return true;
   }
@@ -1238,20 +1260,14 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
         Ok(None) => break,
         Err(_) => None,
       };
-      let mut received_command = false;
       while let Some(command) = received {
         if !self.handle_command(command).await {
           return;
         }
-        received_command = true;
         received = match self.commands_receiver.try_recv() {
           Ok(v) => Some(v),
           Err(_) => None,
         };
-      }
-      if received_command {
-        // received subscribe or unsubscribe command, which means that state needs to be saved
-        self.save_state();
       }
       if (self.needs_resolving && last_resolving.elapsed() >= Duration::from_secs(9)) || self.resolve_now
       {
@@ -1308,7 +1324,156 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
         status: SubscriptionStatus::Unresolved,
       });
       //*self.self_info.rx_channels[lci].friendly_name.write().unwrap() = chst.local_channel_name;
-      self.subscribe(lci, &chst.tx_channel_name, &chst.tx_hostname).await;
+      self.subscribe(lci, &chst.tx_channel_name, &chst.tx_hostname, false).await;
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::device_info::Channel;
+  use crate::protocol::proto_arc::test_device_info;
+  use crate::util::real_time_box_channel;
+  use std::path::PathBuf;
+  use std::time::{SystemTime, UNIX_EPOCH};
+
+  const CHANNELS: usize = 4;
+
+  fn temp_dir() -> PathBuf {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("inferno_aoip_subscriber_test_{ts}_{n}"))
+  }
+
+  /// One "process": a subscriber over `state_dir`. `mcast_capacity` is the size of the multicast
+  /// notification queue; nothing drains it, so a small one models a stalled multicast sender.
+  struct Instance {
+    handle: ChannelsSubscriber,
+    task: tokio::task::JoinHandle<()>,
+    _mcast_rx: mpsc::Receiver<MulticastMessage>,
+  }
+
+  fn start(state_dir: &std::path::Path, mcast_capacity: usize) -> Instance {
+    let mut info = test_device_info();
+    info.ip_address = std::net::Ipv4Addr::LOCALHOST;
+    info.rx_channels = (0..CHANNELS)
+      .map(|i| Channel {
+        factory_name: format!("{:02}", i + 1),
+        friendly_name: Arc::new(RwLock::new(format!("RX {}", i + 1))),
+      })
+      .collect();
+    let info = Arc::new(info);
+    let storage = Arc::new(StateStorage::new(&info, state_dir));
+    let (_clock_tx, clock_rx) = real_time_box_channel::channel(Box::new(None));
+    let ref_instant = Instant::now();
+    let (flows_recv, _flows_thread) = FlowsReceiver::<ExternalBuffer<Atomic<Sample>>>::start(
+      info.clone(),
+      clock_rx,
+      ref_instant,
+      None,
+      Arc::new(AtomicUsize::new(0)),
+      None,
+    );
+    let (mcast_tx, mcast_rx) = mpsc::channel(mcast_capacity);
+    let (handle, fut) = ChannelsSubscriber::new(
+      info.clone(),
+      Arc::new(RwLock::new(MediaClock::new(false))),
+      Arc::new(flows_recv),
+      Arc::new(MdnsClient::new(info.clone())),
+      mcast_tx,
+      ExternalBuffering::new(vec![], 0),
+      0,
+      storage,
+      None,
+      ref_instant,
+    );
+    Instance { handle, task: tokio::spawn(fut), _mcast_rx: mcast_rx }
+  }
+
+  fn saved_channels(state_dir: &std::path::Path) -> Vec<(u16, String, String)> {
+    let path = state_dir.join(hex::encode(test_device_info().factory_device_id)).join("rx_subscriptions.toml");
+    match std::fs::read_to_string(path) {
+      Ok(text) => toml::from_str::<SavedChannelsState>(&text)
+        .unwrap()
+        .channels
+        .into_iter()
+        .map(|c| (c.local_channel_id, c.tx_channel_name, c.tx_hostname))
+        .collect(),
+      Err(_) => vec![],
+    }
+  }
+
+  async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
+    for _ in 0..400 {
+      if cond() {
+        return;
+      }
+      sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for {what}");
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn removal_is_saved_before_an_abrupt_stop_and_not_restored() {
+    let dir = temp_dir();
+    let first = start(&dir, 100);
+    first.handle.subscribe(0, "tx1", "peer").await;
+    first.handle.subscribe(1, "tx2", "peer").await;
+    wait_for("both subscriptions saved", || saved_channels(&dir).len() == 2).await;
+
+    first.handle.unsubscribe(0).await;
+    first.handle.unsubscribe(1).await;
+    wait_for("both removals saved", || saved_channels(&dir).is_empty()).await;
+    // The process is killed: the task is dropped without Shutdown or any final save.
+    first.task.abort();
+    drop(first.handle);
+
+    let second = start(&dir, 100);
+    sleep(Duration::from_millis(300)).await;
+    for ch in 0..CHANNELS {
+      assert!(second.handle.channel_status(ch).is_none(), "channel {ch} was restored");
+    }
+    second.task.abort();
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn subscription_is_restored_after_an_abrupt_stop() {
+    let dir = temp_dir();
+    let first = start(&dir, 100);
+    first.handle.subscribe(2, "tx3", "peer").await;
+    wait_for("subscription saved", || saved_channels(&dir).len() == 1).await;
+    first.task.abort();
+    drop(first.handle);
+
+    let second = start(&dir, 100);
+    wait_for("subscription restored", || second.handle.channel_status(2).is_some()).await;
+    let restored = second.handle.channel_status(2).unwrap();
+    assert_eq!((restored.tx_channel_name.as_str(), restored.tx_hostname.as_str()), ("tx3", "peer"));
+    assert!(second.handle.channel_status(0).is_none());
+    // Loading must not shrink the state file.
+    assert_eq!(saved_channels(&dir).len(), 1);
+    second.task.abort();
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  /// A stalled multicast queue (notifications are awaited) must not hold back the save.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn removal_is_saved_even_when_the_notification_queue_is_stalled() {
+    let dir = temp_dir();
+    let first = start(&dir, 1);
+    first.handle.subscribe(0, "tx1", "peer").await;
+    wait_for("subscription saved", || saved_channels(&dir).len() == 1).await;
+    // Nothing drains the queue: the first notification fills it and the second one blocks the loop.
+    first.handle.unsubscribe(0).await;
+    wait_for("first removal saved", || saved_channels(&dir).is_empty()).await;
+    first.handle.subscribe(1, "tx2", "peer").await;
+    wait_for("second subscription saved", || saved_channels(&dir).len() == 1).await;
+    first.handle.unsubscribe(1).await;
+    wait_for("second removal saved", || saved_channels(&dir).is_empty()).await;
+    first.task.abort();
+    std::fs::remove_dir_all(&dir).ok();
   }
 }
