@@ -36,6 +36,32 @@ use super::flows_rx::{FlowInfo, FlowsReceiver};
 
 const REORDER_WAIT_SAMPLES: usize = 4800;
 
+/// How soon a subscription that could not be set up (the transmitter did not answer the mDNS question,
+/// or did not grant the flow) is tried again, and how far the delay grows. ONS fork (issue #131):
+/// upstream waited a fixed 9 s (measured from the end of the failed attempt and noticed only every
+/// 2 s), so after a link flap, when the first attempt ran before multicast worked again, the
+/// subscriptions came back about 15 s after the restart.
+const RESOLVE_RETRY_MIN: Duration = Duration::from_secs(1);
+const RESOLVE_RETRY_MAX: Duration = Duration::from_secs(9);
+/// The longest the command loop sleeps (it also scans the flows each time it wakes).
+const LOOP_IDLE_WAIT: Duration = Duration::from_secs(2);
+
+/// The wait before the next retry when a retry that waited `previous` failed again: doubles up to the
+/// maximum.
+fn next_resolve_retry_delay(previous: Duration) -> Duration {
+  (previous * 2).clamp(RESOLVE_RETRY_MIN, RESOLVE_RETRY_MAX)
+}
+
+/// How long the command loop may sleep: until the next resolve attempt is due while subscriptions are
+/// unresolved, otherwise the idle wait.
+fn loop_wait(needs_resolving: bool, since_last_resolve: Duration, retry_delay: Duration) -> Duration {
+  if needs_resolving {
+    retry_delay.saturating_sub(since_last_resolve).clamp(Duration::from_millis(20), LOOP_IDLE_WAIT)
+  } else {
+    LOOP_IDLE_WAIT
+  }
+}
+
 enum Command {
   Shutdown,
   Subscribe { local_channel_index: usize, tx_channel_name: String, tx_hostname: String },
@@ -362,6 +388,7 @@ struct ChannelsSubscriberInternal<P: ProxyToSamplesBuffer, B: ChannelsBuffering<
   ref_instant: Instant,
   needs_resolving: bool,
   resolve_now: bool,
+  resolve_retry_delay: Duration,
 }
 
 impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
@@ -400,6 +427,7 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
       ref_instant,
       needs_resolving: false,
       resolve_now: false,
+      resolve_retry_delay: RESOLVE_RETRY_MIN,
     };
   }
   async fn notify_channels_change(&self, channel_indices: impl IntoIterator<Item = usize>) {
@@ -464,6 +492,7 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
     });
     self.needs_resolving = true;
     self.resolve_now = true;
+    self.resolve_retry_delay = RESOLVE_RETRY_MIN;
     if persist {
       self.save_state();
     }
@@ -1255,7 +1284,8 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
     let mut last_resolving = Instant::now();
     loop {
       // TODO make it more NOHZ
-      let mut received = match timeout(Duration::from_secs(2), self.commands_receiver.recv()).await {
+      let wait = loop_wait(self.needs_resolving, last_resolving.elapsed(), self.resolve_retry_delay);
+      let mut received = match timeout(wait, self.commands_receiver.recv()).await {
         Ok(Some(command)) => Some(command),
         Ok(None) => break,
         Err(_) => None,
@@ -1269,10 +1299,20 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
           Err(_) => None,
         };
       }
-      if (self.needs_resolving && last_resolving.elapsed() >= Duration::from_secs(9)) || self.resolve_now
-      {
+      if (self.needs_resolving && last_resolving.elapsed() >= self.resolve_retry_delay) || self.resolve_now {
+        let is_retry = !self.resolve_now;
         self.resolve_subscriptions().await;
         last_resolving = Instant::now();
+        if self.channels.iter().flatten().any(|chsub| chsub.remote.is_none()) {
+          // some channel is still unresolved: try again soon, and a little later each time
+          self.needs_resolving = true;
+          if is_retry {
+            self.resolve_retry_delay = next_resolve_retry_delay(self.resolve_retry_delay);
+          }
+          debug!("subscriptions still unresolved, next attempt in {:?}", self.resolve_retry_delay);
+        } else {
+          self.resolve_retry_delay = RESOLVE_RETRY_MIN;
+        }
       }
       self.scan_flows().await;
     }
@@ -1333,6 +1373,31 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
 mod tests {
   use super::*;
   use crate::device_info::Channel;
+
+  #[test]
+  fn resolve_retry_delay_doubles_up_to_the_maximum() {
+    let mut d = RESOLVE_RETRY_MIN;
+    let mut seen = vec![];
+    for _ in 0..6 {
+      d = next_resolve_retry_delay(d);
+      seen.push(d.as_secs());
+    }
+    assert_eq!(seen, [2, 4, 8, 9, 9, 9]);
+  }
+
+  #[test]
+  fn loop_wakes_when_the_next_resolve_attempt_is_due() {
+    let ms = Duration::from_millis;
+    // nothing to resolve: idle wait
+    assert_eq!(loop_wait(false, ms(0), ms(1000)), LOOP_IDLE_WAIT);
+    // retry due in 700 ms
+    assert_eq!(loop_wait(true, ms(300), ms(1000)), ms(700));
+    // overdue: wake at once (but never a zero timeout)
+    assert_eq!(loop_wait(true, ms(5000), ms(1000)), ms(20));
+    // a long delay is capped by the idle wait
+    assert_eq!(loop_wait(true, ms(0), Duration::from_secs(9)), LOOP_IDLE_WAIT);
+  }
+
   use crate::protocol::proto_arc::test_device_info;
   use crate::util::real_time_box_channel;
   use std::path::PathBuf;
