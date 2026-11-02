@@ -324,6 +324,7 @@ pub struct SettingsBuilder {
   tx_channels: u16,
   clock_path: Option<PathBuf>,
   clock_status: Option<ClockStatusHandle>,
+  tx_requires_clock_leader: bool,
   use_safe_clock: bool,
   tx_source_bit_depth: u8,
   state_dir: Option<PathBuf>,
@@ -360,6 +361,7 @@ impl SettingsBuilder {
       tx_channels: 2,
       clock_path: None,
       clock_status: None,
+      tx_requires_clock_leader: false,
       use_safe_clock: false,
       tx_source_bit_depth: 32,
       state_dir: None,
@@ -473,6 +475,17 @@ impl SettingsBuilder {
   /// (see [`ClockStatusHandle`]). Without it Inferno reads `/tmp/clock-stats.*` (Linux PTP helper).
   pub fn clock_status(mut self, handle: ClockStatusHandle) -> Self {
     self.clock_status = Some(handle);
+    self
+  }
+
+  /// ONS fork: transmit only while the host reports a followed clock leader through the
+  /// [`SettingsBuilder::clock_status`] handle (`HostClockStatus::master_clock_id` is `Some`). Without a
+  /// leader the media clock is the host's own free-running clock, and packets stamped with it are useless
+  /// to receivers. The transmitter then sends nothing, and re-seeds its flows on the leader's timeline when
+  /// the leader appears. Default false (transmit as soon as the media clock is ready). Needs a
+  /// `clock_status` handle; without one it has no effect.
+  pub fn tx_requires_clock_leader(mut self, yes: bool) -> Self {
+    self.tx_requires_clock_leader = yes;
     self
   }
 
@@ -693,6 +706,7 @@ impl SettingsBuilder {
       tx_latency_ns: self.tx_latency_ns,
       clock_path: self.clock_path,
       clock_status: self.clock_status,
+      tx_requires_clock_leader: self.tx_requires_clock_leader,
       use_safe_clock: self.use_safe_clock,
       tx_source_bit_depth: self.tx_source_bit_depth,
       state_dir,
@@ -800,6 +814,8 @@ pub struct Settings {
   /// ONS fork: host-supplied clock status for the clock-stats reply. `None` keeps the Linux
   /// `/tmp/clock-stats.*` file path.
   pub clock_status: Option<ClockStatusHandle>,
+  /// ONS fork: see [`SettingsBuilder::tx_requires_clock_leader`].
+  pub tx_requires_clock_leader: bool,
   pub use_safe_clock: bool,
   pub tx_source_bit_depth: u8,
   /// Persistent state directory (see [`SettingsBuilder::state_dir`], [`default_state_dir`]).
