@@ -18,6 +18,7 @@ use super::samples_utils::*;
 use super::tx_multicasts::MEDIA_PORT;
 use crate::device_server::TransferNotifier;
 use crate::media_clock::{async_clock_receiver_to_realtime, ClockStatusHandle};
+use crate::utils::LogAndForget;
 use crate::ring_buffer::{ProxyToSamplesBuffer, RBOutput};
 use crate::util::os::set_current_thread_realtime;
 use crate::util::real_time_box_channel::RealTimeBoxReceiver;
@@ -512,7 +513,11 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
         Command::SetChannels { index, channel_indices } => {
           self.refresh_clock();
           let now_opt = self.now();
-          let flow = self.flows[index].as_mut().unwrap();
+          let Some(flow) = self.flows[index].as_mut() else {
+            // The flow was removed after the command was queued.
+            warn!("channels changed for flow index={index} that no longer exists");
+            continue;
+          };
           flow.channel_indices = channel_indices;
           if let Some(now) = now_opt {
             flow.keep_alive(now as Clock, self.sample_rate);
@@ -808,7 +813,8 @@ impl FlowsTransmitter {
       self.ip_port_to_id.remove(&flow.remote);
     }
     self.flows_info[index as usize] = None;
-    self.commands_sender.send(Command::RemoveFlow { index: index as usize }).await.unwrap();
+    // Fails only when the transmit thread has already stopped; there is nothing left to remove then.
+    self.commands_sender.send(Command::RemoveFlow { index: index as usize }).await.log_and_forget();
   }
   pub async fn remove_flow(&mut self, handle: FlowHandle) -> Result<usize, std::io::Error> {
     if let Some((id, _)) = self.get_flow(handle) {
@@ -842,9 +848,11 @@ impl FlowsTransmitter {
         .commands_sender
         .send(Command::SetChannels { index: index as usize, channel_indices: channel_indices.clone() })
         .await
-        .unwrap();
+        .log_and_forget();
 
-      self.flows_info[index as usize].as_mut().unwrap().local_channel_indices = channel_indices;
+      if let Some(info) = self.flows_info.get_mut(index as usize).and_then(|info| info.as_mut()) {
+        info.local_channel_indices = channel_indices;
+      }
       Ok(index as usize)
     } else {
       Err(std::io::Error::from(std::io::ErrorKind::NotFound))
@@ -856,7 +864,7 @@ impl FlowsTransmitter {
       .iter()
       .filter_map(|(index, flow)| {
         if flow.expired.load(Ordering::Acquire)
-          && !self.flows_info[*index as usize].as_ref().unwrap().is_multicast()
+          && !self.flows_info.get(*index as usize).and_then(|info| info.as_ref()).is_some_and(|info| info.is_multicast())
         {
           info!("removing expired flow (internal id {index}) dst {}", flow.remote);
           Some(*index)
