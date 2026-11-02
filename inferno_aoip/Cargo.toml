@@ -50,3 +50,7 @@ features = ["derive"]
 [dependencies.tokio]
 version = "1.36"
 features = ["net", "time", "sync", "signal"]
+
+# ONS fork: MMCSS "Pro Audio" registration for the TX/RX threads (ZanyHunter/open-network-soundcard#145).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
