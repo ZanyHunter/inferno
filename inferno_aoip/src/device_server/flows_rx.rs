@@ -106,7 +106,9 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
         Ok((recv_size, src)) => {
           if recv_size < 9 {
             error!("received corrupted (too small) packet on flow socket");
-            return Command::NoOp;
+            // Keep draining: the socket is polled edge-triggered, so packets left in its queue would
+            // not wake the thread again.
+            continue;
           }
           let timestamp = (u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize)
             .wrapping_mul(sample_rate as usize)

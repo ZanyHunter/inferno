@@ -1345,14 +1345,17 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
         self.state_storage.load::<SavedChannelsState>("channels")
         // TODO: remove old state after migration
       });
-      if let Err(e) = result {
-        warn!("Unable to load state (this is normal in first run): {e:?}");
-        return;
+      match result {
+        Ok(state) => state.channels,
+        Err(e) => {
+          warn!("Unable to load state (this is normal in first run): {e:?}");
+          return;
+        }
       }
-      result.unwrap().channels
     };
     for chst in channels {
-      let lci = chst.local_channel_id as usize - 1;
+      // Channel ids count from 1; a corrupt state file may hold 0.
+      let lci = (chst.local_channel_id as usize).wrapping_sub(1);
       if lci >= self.channels.len() {
         warn!("loading state containing channel id {} while we have {} channels. State of this channel will be lost on next save.", chst.local_channel_id, self.channels.len());
         // TODO: this is actually harmful for the UX
