@@ -88,6 +88,9 @@ pub async fn run_server(
           if channel_indices.iter().flatten().find(|&&chi| chi >= self_info.tx_channels.len()).is_some() {
             error!("too large channel number, returning error");
             conn.respond_with_code(0x0302u16 /* ??? TODO */, &[]).await;
+            // ONS fork: upstream fell through here, answered a second time and created the flow, and the
+            // TX thread then indexed a channel that does not exist.
+            continue;
           }
           if sample_rate != self_info.sample_rate {
             error!("sample rate mismatch, returning error");
