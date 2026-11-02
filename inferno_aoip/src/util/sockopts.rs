@@ -193,4 +193,72 @@ mod tests {
       "SKIP: no multicast datagram delivered over loopback within 1 s (no loopback multicast route?)"
     );
   }
+
+  /// Non-loopback, non-link-local IPv4 addresses of this host, or the two given by
+  /// `INFERNO_TEST_NIC_A` and `INFERNO_TEST_NIC_B`.
+  fn two_test_nics() -> Option<(Ipv4Addr, Ipv4Addr)> {
+    let from_env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<Ipv4Addr>().ok());
+    if let (Some(a), Some(b)) = (from_env("INFERNO_TEST_NIC_A"), from_env("INFERNO_TEST_NIC_B")) {
+      return Some((a, b));
+    }
+    let mut ips: Vec<Ipv4Addr> = local_ip_address::list_afinet_netifas()
+      .ok()?
+      .into_iter()
+      .filter_map(|(_, ip)| match ip {
+        std::net::IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_link_local() => Some(v4),
+        _ => None,
+      })
+      .collect();
+    ips.sort();
+    ips.dedup();
+    (ips.len() >= 2).then(|| (ips[0], ips[1]))
+  }
+
+  /// W6 acceptance test: with two NICs, multicast sent through the socket prepared by
+  /// `apply_multicast_egress_platform` for NIC A is seen by a receiver joined on NIC A and not by one
+  /// joined on NIC B. The host delivers its own multicast back to local members of the egress
+  /// interface, so this shows which interface the datagram left on without a packet capture.
+  ///
+  /// Needs two NICs that are up, so it is `#[ignore]`d. Run with
+  /// `cargo test -p inferno_aoip two_nics -- --ignored --nocapture` (optionally with
+  /// `INFERNO_TEST_NIC_A` / `INFERNO_TEST_NIC_B` set to two local IPv4 addresses). Windows only: other
+  /// platforms ignore the platform wrapper and leave egress to the routing table.
+  #[test]
+  #[ignore = "needs two NICs that are up; run manually with --ignored"]
+  fn two_nics_multicast_leaves_on_the_selected_interface() {
+    if !cfg!(windows) {
+      eprintln!("SKIP: the egress selection is applied on Windows only");
+      return;
+    }
+    let Some((nic_a, nic_b)) = two_test_nics() else {
+      eprintln!("SKIP: fewer than two usable IPv4 NICs");
+      return;
+    };
+    eprintln!("NIC A (egress) = {nic_a}, NIC B = {nic_b}");
+    let group = Ipv4Addr::new(239, 255, 66, 9);
+    let port = 41_000 + (std::process::id() % 2000) as u16;
+    let rx_a = bind_multicast_receiver(SocketAddrV4::new(group, port), nic_a).expect("join on A");
+    let rx_b = bind_multicast_receiver(SocketAddrV4::new(group, port), nic_b).expect("join on B");
+    let tx = UdpSocket::bind((nic_a, 0)).unwrap();
+    apply_multicast_egress_platform(&tx, nic_a);
+    assert_eq!(SockRef::from(&tx).multicast_if_v4().unwrap(), nic_a);
+    SockRef::from(&tx).set_multicast_loop_v4(true).unwrap();
+    tx.send_to(b"ons-w6-two-nics", (group, port)).unwrap();
+
+    let drain = |rx: &mio::net::UdpSocket| -> bool {
+      let mut buf = [0u8; 64];
+      for _ in 0..25 {
+        match rx.recv_from(&mut buf) {
+          Ok((n, _)) => return &buf[..n] == b"ons-w6-two-nics",
+          Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(20)),
+          Err(e) => panic!("recv: {e}"),
+        }
+      }
+      false
+    };
+    let got_a = drain(&rx_a);
+    let got_b = drain(&rx_b);
+    assert!(got_a, "receiver on the selected NIC {nic_a} did not get the datagram");
+    assert!(!got_b, "receiver on NIC {nic_b} got a datagram that should have left on {nic_a}");
+  }
 }
