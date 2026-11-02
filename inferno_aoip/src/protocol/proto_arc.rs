@@ -406,9 +406,12 @@ impl<'a, T: BinarySerde> Iterator for ItemsInPacketIterator<'a, T> {
 
 pub fn deserialize_items<'a, T: BinarySerde>(payload: &'a [u8]) -> ItemsInPacketIterator<'a, T> {
   let num_items: usize = (*payload.get(1).unwrap_or(&0)).into();
-  let num_items = num_items.min(payload.len() / T::SERIALIZED_SIZE);
+  // The items follow the two-byte count. A payload shorter than that has none, and a count larger than
+  // what the packet holds is cut down to it (never slice past the end: this reads network input).
+  let body = payload.get(2..).unwrap_or(&[]);
+  let num_items = num_items.min(body.len() / T::SERIALIZED_SIZE);
   ItemsInPacketIterator::<'a, T> {
-    items_bytes: &payload[2..][..num_items * T::SERIALIZED_SIZE],
+    items_bytes: &body[..num_items * T::SERIALIZED_SIZE],
     item_start: 0,
     _t: Default::default(),
   }
@@ -451,6 +454,28 @@ mod tests {
   use super::*;
   use binary_serde::recursive_array::RecursiveArray;
   use binary_serde::BinarySerde;
+
+  #[test]
+  fn deserialize_items_never_slices_past_the_payload() {
+    // Whatever the count byte says and however short the payload is, no length panics.
+    for len in 0..40usize {
+      for count in [0u8, 1, 2, 3, 7, 255] {
+        let mut payload = vec![0u8; len];
+        if len > 1 {
+          payload[1] = count;
+        }
+        let n = deserialize_items::<u16>(&payload).count();
+        assert!(n <= len.saturating_sub(2) / 2, "len {len} count {count}");
+        assert!(n <= usize::from(count));
+      }
+    }
+    // Two u16 items, the count byte claims more than there is room for.
+    assert_eq!(deserialize_items::<u16>(&[0, 9, 0, 1, 0, 2]).collect::<Vec<_>>(), vec![1, 2]);
+    // An odd trailing byte is ignored.
+    assert_eq!(deserialize_items::<u16>(&[0, 9, 0, 1, 0, 2, 7]).collect::<Vec<_>>(), vec![1, 2]);
+    assert_eq!(deserialize_items::<u16>(&[]).count(), 0);
+    assert_eq!(deserialize_items::<u16>(&[0]).count(), 0);
+  }
 
   #[test]
   fn flags2_bitfield_roundtrip() {

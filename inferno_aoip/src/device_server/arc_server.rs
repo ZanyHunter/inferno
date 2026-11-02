@@ -420,16 +420,16 @@ pub async fn run_server(
           let content = request.content();
           let mut flow_ids = vec![];
           for descr_offset in deserialize_items::<u16>(content) {
-            let descr_offset: usize = descr_offset.into();
-            if descr_offset - HEADER_LENGTH
-              + create_multicast_tx_flow::FlowDescriptorHeader::SERIALIZED_SIZE
-              > content.len()
-            {
+            let Some(descr_start) = usize::from(descr_offset).checked_sub(HEADER_LENGTH) else {
+              error!("multicast tx flow descriptor offset {descr_offset} points into the packet header");
               continue;
-            }
+            };
+            const HEADER_SIZE: usize = create_multicast_tx_flow::FlowDescriptorHeader::SERIALIZED_SIZE;
+            let Some(after_header) = content.get(descr_start..).and_then(|d| d.get(HEADER_SIZE..)) else {
+              continue;
+            };
             if let Ok(descr) = create_multicast_tx_flow::FlowDescriptorHeader::binary_deserialize(
-              &content[descr_offset - HEADER_LENGTH..]
-                [..create_multicast_tx_flow::FlowDescriptorHeader::SERIALIZED_SIZE],
+              &content[descr_start..][..HEADER_SIZE],
               binary_serde::Endianness::Big,
             ) {
               if descr.flow_type != 2 {
@@ -450,27 +450,29 @@ pub async fn run_server(
                   error!("trying to create multicast tx flow but we have no flows transmitter active");
                   continue;
                 };
-                if flows_tx.get_flows_info()[flow_index].is_some() {
+                if flows_tx.get_flows_info().get(flow_index).map_or(true, |f| f.is_some()) {
                   // TODO move this check to tx_multicasts or flows_tx
                   error!("tx flow id busy: {}", descr.flow_id);
                   continue;
                 }
               }
-              let after_header = &content[descr_offset - HEADER_LENGTH
-                + create_multicast_tx_flow::FlowDescriptorHeader::SERIALIZED_SIZE..];
-              if after_header.len()
-                < (descr.channels_count as usize)
-                  + create_multicast_tx_flow::FlowDescriptorFooter::SERIALIZED_SIZE
+              // Each channel is a `u16` id, followed by the footer.
+              let channels_len = (descr.channels_count as usize) * 2;
+              if after_header.len() < channels_len + create_multicast_tx_flow::FlowDescriptorFooter::SERIALIZED_SIZE
               {
                 error!("multicast tx flow descriptor parse failed, too short channels list or footer");
                 continue;
               }
-              let channels_bytes = &after_header[..(descr.channels_count as usize) * 2];
+              let channels_bytes = &after_header[..channels_len];
               let channel_indices = channels_bytes
                 .chunks_exact(2)
-                .map(|chunk| u16::from_be_bytes(chunk.try_into().unwrap()))
-                .map(|id| if id > 0 { Some((id - 1).try_into().unwrap()) } else { None })
+                .map(|chunk| make_u16(chunk[0], chunk[1]))
+                .map(|id| if id > 0 { Some(usize::from(id - 1)) } else { None })
                 .collect_vec();
+              if channel_indices.iter().flatten().any(|&chi| chi >= self_info.tx_channels.len()) {
+                error!("multicast tx flow {} names a transmit channel that does not exist", descr.flow_id);
+                continue;
+              }
 
               if let Some(txm) = tx_multicasts.lock().await.as_ref() {
                 txm.add_flow(flow_index, channel_indices).await;
@@ -486,10 +488,11 @@ pub async fn run_server(
           }
           if flow_ids.len() > 0 {
             let mut response = ByteBuffer::new();
-            response.write_u16(flow_ids.len().try_into().unwrap());
+            // At most MAX_TX_FLOWS entries, so these fit in a u16.
+            response.write_u16(flow_ids.len() as u16);
             response.write_u16(0);
             for id in flow_ids {
-              response.write_u16(id.try_into().unwrap());
+              response.write_u16(id as u16);
             }
             conn.respond(response.as_bytes()).await;
           } else {
@@ -498,12 +501,19 @@ pub async fn run_server(
         }
         delete_multicast_tx_flow::OPCODE => {
           let content = request.content();
-          let count = make_u16(content[0], content[1]).try_into().unwrap();
-          let flow_indices = content[4..]
+          let (count, ids) = match (content.get(0..2), content.get(4..)) {
+            (Some(&[hi, lo]), Some(ids)) => (usize::from(make_u16(hi, lo)), ids),
+            _ => {
+              error!("delete multicast tx flow request too short: {}", hex::encode(content));
+              continue;
+            }
+          };
+          let flow_indices = ids
             .chunks_exact(2)
-            .map(|chunk| u16::from_be_bytes(chunk.try_into().unwrap()))
+            .map(|chunk| make_u16(chunk[0], chunk[1]))
             .take(count)
-            .filter_map(|id| if id > 0 { Some((id as usize) - 1) } else { None });
+            .filter_map(|id| if id > 0 { Some(usize::from(id) - 1) } else { None })
+            .filter(|&index| index < MAX_TX_FLOWS as usize);
 
           let mut deleted_any = false;
 
@@ -673,7 +683,7 @@ pub async fn run_server(
               if req.local_channel_id == 0 {
                 continue;
               }
-              let local_channel_index = (req.local_channel_id - 1).try_into().unwrap();
+              let local_channel_index = usize::from(req.local_channel_id - 1);
               if local_channel_index >= self_info.rx_channels.len() {
                 error!("got connect/disconnect request for nonexisting channel {}", req.local_channel_id);
                 continue;
@@ -695,10 +705,8 @@ pub async fn run_server(
                   "connection requested: {} <- {:?} @ {:?}",
                   req.local_channel_id, tx_channel_name, tx_hostname
                 );
-                if tx_channel_name.is_some() && tx_hostname.is_some() {
-                  channels_recv
-                    .subscribe(local_channel_index, tx_channel_name.unwrap(), tx_hostname.unwrap())
-                    .await;
+                if let (Some(tx_channel_name), Some(tx_hostname)) = (tx_channel_name, tx_hostname) {
+                  channels_recv.subscribe(local_channel_index, tx_channel_name, tx_hostname).await;
                 } else {
                   error!("couldn't read tx names from subscription request: {}", hex::encode(&c_whole));
                 }
@@ -717,8 +725,18 @@ pub async fn run_server(
           // whole packet: "27ff00104a1c30140000000100000002"
           if let Some(channels_recv) = &subscriber {
             let content = request.content();
-            let local_channel = make_u16(content[4], content[5]);
-            let local_channel_index = (local_channel - 1) as usize;
+            let local_channel = match content.get(4..6) {
+              Some(&[hi, lo]) => make_u16(hi, lo),
+              _ => {
+                error!("disconnect request too short: {}", hex::encode(content));
+                continue;
+              }
+            };
+            let local_channel_index = usize::from(local_channel).wrapping_sub(1);
+            if local_channel_index >= self_info.rx_channels.len() {
+              error!("got disconnect request for nonexisting channel {local_channel}");
+              continue;
+            }
             info!("disconnect requested: local channel {}", local_channel);
             channels_recv.unsubscribe(local_channel_index).await;
             conn.respond(&[]).await;
