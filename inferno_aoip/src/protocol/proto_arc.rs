@@ -414,6 +414,38 @@ pub fn deserialize_items<'a, T: BinarySerde>(payload: &'a [u8]) -> ItemsInPacket
   }
 }
 
+/// A fully filled device description for tests in this crate.
+#[cfg(test)]
+pub(crate) fn test_device_info() -> DeviceInfo {
+  DeviceInfo {
+    ip_address: std::net::Ipv4Addr::new(192, 168, 1, 1),
+    netmask: std::net::Ipv4Addr::new(255, 255, 255, 0),
+    gateway: std::net::Ipv4Addr::new(192, 168, 1, 1),
+    mac_address: netdev::mac::MacAddr::from_hex_format("00:11:22:33:44:55"),
+    link_speed: 1000,
+    board_name: "TestBoard".to_string(),
+    manufacturer: "TestMfg".to_string(),
+    model_name: "TestModel".to_string(),
+    model_number: "123".to_string(),
+    factory_device_id: [1, 2, 3, 4, 5, 6, 7, 8],
+    process_id: 1,
+    vendor_string: "TestVendor".to_string(),
+    friendly_hostname: std::sync::Arc::new(std::sync::RwLock::new("test".to_string())),
+    factory_hostname: "factory".to_string(),
+    rx_channels: vec![],
+    tx_channels: vec![],
+    bits_per_sample: 24,
+    pcm_type: 0x0e,
+    latency_ns: 5000000,
+    sample_rate: 48000,
+    capabilities: crate::device_info::DeviceCapabilities::fixed_latency(5000000),
+    arc_port: 4440,
+    cmc_port: 8800,
+    flows_control_port: 4455,
+    info_request_port: 8700,
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -473,32 +505,7 @@ mod tests {
 
   #[test]
   fn common_channels_descriptor_new_matches_device_info() {
-    let device = DeviceInfo {
-      ip_address: std::net::Ipv4Addr::new(192, 168, 1, 1),
-      netmask: std::net::Ipv4Addr::new(255, 255, 255, 0),
-      gateway: std::net::Ipv4Addr::new(192, 168, 1, 1),
-      mac_address: netdev::mac::MacAddr::from_hex_format("00:11:22:33:44:55"),
-      link_speed: 1000,
-      board_name: "TestBoard".to_string(),
-      manufacturer: "TestMfg".to_string(),
-      model_name: "TestModel".to_string(),
-      model_number: "123".to_string(),
-      factory_device_id: [1, 2, 3, 4, 5, 6, 7, 8],
-      process_id: 1,
-      vendor_string: "TestVendor".to_string(),
-      friendly_hostname: "test".to_string(),
-      factory_hostname: "factory".to_string(),
-      rx_channels: vec![],
-      tx_channels: vec![],
-      bits_per_sample: 24,
-      pcm_type: 0x0e,
-      latency_ns: 5000000,
-      sample_rate: 48000,
-      arc_port: 4440,
-      cmc_port: 8800,
-      flows_control_port: 4455,
-      info_request_port: 8700,
-    };
+    let device = test_device_info();
     let desc = CommonChannelsDescriptor::new(&device);
     assert_eq!(desc.sample_rate, 48000);
     assert_eq!(desc.bits_per_sample_1, 24);

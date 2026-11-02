@@ -134,7 +134,7 @@ async fn test_loopback_trx() {
   let mut tx_server = DeviceServer::start_with_clock(tx_settings, Some(clock.clone())).await;
   let mut rx_server = DeviceServer::start_with_clock(rx_settings, Some(clock)).await;
 
-  let tx_hostname = tx_server.self_info.friendly_hostname.clone();
+  let tx_hostname = tx_server.self_info.friendly_hostname().clone();
 
   let tx_clock_rx = tx_server.get_realtime_clock_receiver();
   let rx_clock_rx = rx_server.get_realtime_clock_receiver();

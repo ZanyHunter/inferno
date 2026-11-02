@@ -26,6 +26,7 @@ use crate::device_info::DeviceInfo;
 
 pub(crate) mod arc_server;
 pub(crate) mod cmc_server;
+pub(crate) mod device_name;
 pub(crate) mod flows_control_server;
 pub(crate) mod info_mcast_server;
 pub(crate) mod mdns_server;
@@ -41,8 +42,11 @@ pub(crate) mod settings;
 pub(crate) mod tx_multicasts;
 
 pub use crate::common::{Clock, ClockDiff, Sample};
-pub use crate::media_clock::{ClockOverlay, ClockPublisher, MediaClock, RealTimeClockReceiver};
+pub use crate::media_clock::{
+  ClockOverlay, ClockPublisher, ClockStatusHandle, HostClockStatus, MediaClock, RealTimeClockReceiver,
+};
 pub use crate::ring_buffer::{new_owned, ExternalBufferParameters, PositionReportDestination, RBInput};
+pub use device_name::{DeviceNaming, DeviceRename, RenameCallback};
 pub use settings::{
   default_state_dir, program_data_state_dir, sanitize_device_name, validate_device_name, NicInfo, NicSelector,
   Settings, SettingsBuilder, SettingsError, MAX_DEVICE_NAME_LEN,
@@ -55,6 +59,16 @@ use samples_collector::{RealTimeSamplesReceiver, SamplesCallback, SamplesCollect
 
 const PEAKS_BUFFER_LEN: usize = 24000;
 const PEAKS_ITER_SLEEP: Duration = Duration::from_millis(100);
+
+/// ONS fork: wait for an audio thread without blocking the async worker that runs the shutdown, so a
+/// thread that does not end can be given up on by a timeout around `DeviceServer::shutdown`.
+async fn join_without_blocking(thread: std::thread::JoinHandle<()>) {
+  match tokio::task::spawn_blocking(move || thread.join()).await {
+    Ok(Ok(())) => {}
+    Ok(Err(_)) => error!("an audio thread panicked"),
+    Err(e) => error!("cannot wait for an audio thread: {e}"),
+  }
+}
 
 pub struct TransferNotifier {
   pub callback: Box<dyn Fn() + Send + Sync>,
@@ -98,6 +112,9 @@ impl DeviceServer {
   pub async fn start_with_clock(settings: settings::Settings, clock: Option<ClockPublisher>) -> Self {
     let self_info = Arc::new(settings.self_info);
     let state_storage = Arc::new(StateStorage::new(&self_info, &settings.state_dir));
+    // A name saved by an earlier rename wins over the configured one; it has to be in place before
+    // anything is advertised.
+    device_name::apply_saved_name(&settings.naming, &state_storage, &self_info);
     let ref_instant = Instant::now();
 
     let (shutdown_send, shdn_recv1) = broadcast_queue::channel(16);
@@ -146,6 +163,7 @@ impl DeviceServer {
         channels_sub_rx.clone(),
         flows_tx.clone(),
         tx_multicasts.clone(),
+        settings.naming.clone(),
         shdn_recv1,
       )),
       tokio::spawn(cmc_server::run_server(self_info.clone(), shdn_recv2)),
@@ -153,6 +171,7 @@ impl DeviceServer {
         self_info.clone(),
         mcast_rx,
         shared_media_clock.clone(),
+        settings.clock_status.clone(),
         channels_sub_rx,
         Box::new(move || ((rxps.read().unwrap())(), (txps.read().unwrap())())),
         shdn_recv3,
@@ -281,7 +300,7 @@ impl DeviceServer {
     let shutdown_todo = async move {
       flows_rx_handle.shutdown().await;
       channels_sub_handle.shutdown().await;
-      flows_rx_thread.join().unwrap();
+      join_without_blocking(flows_rx_thread).await;
       for task in tasks {
         task.await.unwrap();
       }
@@ -381,7 +400,7 @@ impl DeviceServer {
         shutdown_send.send(()).unwrap();
         flows_control_task.await.unwrap();
         *flows_tx.lock().await = None;
-        flows_tx_thread.join().unwrap();
+        join_without_blocking(flows_tx_thread).await;
         //peaks_thread.join().unwrap();
         info!("transmitter stopped");
       }

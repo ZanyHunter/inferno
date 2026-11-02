@@ -42,6 +42,14 @@ impl StateStorage {
     std::fs::rename(tmp_path, self.full_path(name))?;
     Ok(())
   }
+  /// ONS fork: delete an item. Removing an item that does not exist is not an error.
+  pub fn remove(&self, name: &str) -> Result<(), Box<dyn Error>> {
+    match std::fs::remove_file(self.full_path(name)) {
+      Ok(()) => Ok(()),
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+      Err(e) => Err(e.into()),
+    }
+  }
   pub fn load<T: for<'a> Deserialize<'a>>(&self, name: &str) -> Result<T, Box<dyn Error>> {
     let mut file = File::open(self.full_path(name))?;
     let mut content: String = "".to_owned();
@@ -112,6 +120,16 @@ mod tests {
     assert!(!storage.full_path("tmp.atomic").exists());
     // final file should exist
     assert!(storage.full_path("atomic").exists());
+  }
+
+  #[test]
+  fn remove_deletes_an_item_and_tolerates_a_missing_one() {
+    let storage = temp_state_storage();
+    storage.save("gone", &TestConfig { name: "x".into(), count: 1 }).unwrap();
+    storage.remove("gone").unwrap();
+    assert!(storage.load::<TestConfig>("gone").is_err());
+    storage.remove("gone").unwrap();
+    storage.remove("never-existed").unwrap();
   }
 
   #[test]

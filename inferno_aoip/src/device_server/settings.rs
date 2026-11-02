@@ -24,7 +24,10 @@ use std::{
 use netdev::mac::MacAddr;
 
 use crate::common::warn;
-use crate::device_info::{Channel, DeviceId, DeviceInfo};
+use crate::device_info::{Channel, DeviceCapabilities, DeviceId, DeviceInfo};
+
+use super::device_name::{DeviceNaming, DeviceRename, RenameCallback};
+use crate::media_clock::ClockStatusHandle;
 use crate::protocol::flows_control::PORT as FLOWS_CONTROL_PORT;
 use crate::protocol::mcast::INFO_REQUEST_PORT;
 use crate::protocol::proto_arc::PORT as ARC_PORT;
@@ -320,9 +323,15 @@ pub struct SettingsBuilder {
   rx_channels: u16,
   tx_channels: u16,
   clock_path: Option<PathBuf>,
+  clock_status: Option<ClockStatusHandle>,
   use_safe_clock: bool,
   tx_source_bit_depth: u8,
   state_dir: Option<PathBuf>,
+  default_device_name: Option<String>,
+  persist_device_name: bool,
+  on_device_rename: Option<RenameCallback>,
+  latency_range: Option<(usize, usize, usize)>,
+  board_flags: Option<[u8; 4]>,
   /// Upstream compatibility: names are not validated (only cut to 31 characters), the default name
   /// keeps its historic `<app> <hex ip>` form, and an IPv4 address that matches no adapter is accepted.
   legacy: bool,
@@ -350,9 +359,15 @@ impl SettingsBuilder {
       rx_channels: 2,
       tx_channels: 2,
       clock_path: None,
+      clock_status: None,
       use_safe_clock: false,
       tx_source_bit_depth: 32,
       state_dir: None,
+      default_device_name: None,
+      persist_device_name: true,
+      on_device_rename: None,
+      latency_range: None,
+      board_flags: None,
       legacy: false,
     }
   }
@@ -454,6 +469,13 @@ impl SettingsBuilder {
     self
   }
 
+  /// ONS fork: let the host supply the grandmaster id and lock state for Dante's clock-stats reply
+  /// (see [`ClockStatusHandle`]). Without it Inferno reads `/tmp/clock-stats.*` (Linux PTP helper).
+  pub fn clock_status(mut self, handle: ClockStatusHandle) -> Self {
+    self.clock_status = Some(handle);
+    self
+  }
+
   /// Use the safe clock mode. Default false.
   pub fn use_safe_clock(mut self, yes: bool) -> Self {
     self.use_safe_clock = yes;
@@ -471,6 +493,44 @@ impl SettingsBuilder {
   /// temporary directory.
   pub fn state_dir(mut self, dir: impl Into<PathBuf>) -> Self {
     self.state_dir = Some(dir.into());
+    self
+  }
+
+  /// ONS fork: the name a controller's "reset name" request (an empty name) goes back to. Must follow
+  /// the Dante name rules. Default: the name the device starts with.
+  pub fn default_device_name(mut self, name: &str) -> Self {
+    self.default_device_name = Some(name.to_owned());
+    self
+  }
+
+  /// ONS fork: whether a rename from a controller is saved in the state folder and wins over
+  /// [`device_name`](Self::device_name) at the next start. Default `true`. A host that keeps the name
+  /// itself turns this off and uses [`on_device_rename`](Self::on_device_rename).
+  pub fn persist_device_name(mut self, persist: bool) -> Self {
+    self.persist_device_name = persist;
+    self
+  }
+
+  /// ONS fork: be told after every rename that a controller made (see [`DeviceRename`]). The host
+  /// should send an mDNS goodbye for the old name and may save the new one.
+  pub fn on_device_rename(mut self, callback: impl Fn(&DeviceRename) + Send + Sync + 'static) -> Self {
+    self.on_device_rename = Some(RenameCallback::new(callback));
+    self
+  }
+
+  /// ONS fork: the receive latency range and default reported to controllers, in nanoseconds
+  /// (`min <= max`; the receive latency itself, [`rx_latency_ns`](Self::rx_latency_ns), should lie in
+  /// it). Default: the range is just the receive latency.
+  pub fn latency_range(mut self, min_ns: usize, max_ns: usize, default_ns: usize) -> Self {
+    self.latency_range = Some((min_ns, max_ns, default_ns));
+    self
+  }
+
+  /// ONS fork: bytes `0x14..0x18` of the board-info reply, the feature flags that Dante Controller reads
+  /// to enable or grey out its controls. Default `[0, 0, 0x10, 0]` (upstream). Which bit enables what is
+  /// partly unknown **(verify)**; see `docs` of the host for the lab findings.
+  pub fn board_flags(mut self, flags: [u8; 4]) -> Self {
+    self.board_flags = Some(flags);
     self
   }
 
@@ -496,6 +556,15 @@ impl SettingsBuilder {
     }
     if self.tx_latency_ns == 0 {
       return Err(invalid("tx_latency_ns", self.tx_latency_ns, "must be greater than 0"));
+    }
+    if let Some((min, max, default)) = self.latency_range {
+      if min == 0 || min > max || default < min || default > max {
+        return Err(invalid(
+          "latency_range",
+          format!("{min}..{max} default {default}"),
+          "must satisfy 0 < min <= default <= max",
+        ));
+      }
     }
     if !matches!(self.tx_source_bit_depth, 16 | 24 | 32) {
       return Err(invalid("tx_source_bit_depth", self.tx_source_bit_depth, "must be one of 16, 24, 32"));
@@ -546,6 +615,32 @@ impl SettingsBuilder {
       }
     };
 
+    let default_name = match (&self.default_device_name, self.legacy) {
+      (Some(name), false) => {
+        validate_device_name(name)?;
+        name.clone()
+      }
+      (Some(name), true) => truncate_chars(name, MAX_DEVICE_NAME_LEN).to_owned(),
+      (None, _) => friendly_hostname.clone(),
+    };
+    let naming = DeviceNaming {
+      default_name,
+      persist: self.persist_device_name,
+      on_rename: self.on_device_rename,
+    };
+    let capabilities = {
+      let (latency_min_ns, latency_max_ns, latency_default_ns) =
+        self.latency_range.unwrap_or((self.rx_latency_ns, self.rx_latency_ns, self.rx_latency_ns));
+      let mut caps = DeviceCapabilities::fixed_latency(self.rx_latency_ns);
+      caps.latency_min_ns = latency_min_ns;
+      caps.latency_max_ns = latency_max_ns;
+      caps.latency_default_ns = latency_default_ns;
+      if let Some(flags) = self.board_flags {
+        caps.board_flags = flags;
+      }
+      caps
+    };
+
     let state_dir = match self.state_dir {
       Some(dir) => dir,
       None => default_state_dir()?,
@@ -570,7 +665,7 @@ impl SettingsBuilder {
       process_id: self.process_id,
       vendor_string: "Audinate Dante-compatible".to_owned(),
       factory_hostname: format!("{short_app_name}-{}", hex::encode(device_id)),
-      friendly_hostname,
+      friendly_hostname: Arc::new(RwLock::new(friendly_hostname)),
       model_number: "_000000000000000b".to_owned(),
       rx_channels: vec![],
       tx_channels: vec![],
@@ -578,6 +673,7 @@ impl SettingsBuilder {
       pcm_type: 0xe,
       latency_ns: self.rx_latency_ns,
       sample_rate: self.sample_rate,
+      capabilities,
 
       arc_port: ARC_PORT,
       cmc_port: CMC_PORT,
@@ -596,9 +692,11 @@ impl SettingsBuilder {
       self_info,
       tx_latency_ns: self.tx_latency_ns,
       clock_path: self.clock_path,
+      clock_status: self.clock_status,
       use_safe_clock: self.use_safe_clock,
       tx_source_bit_depth: self.tx_source_bit_depth,
       state_dir,
+      naming,
     };
     settings.make_rx_channels(self.rx_channels as usize);
     settings.make_tx_channels(self.tx_channels as usize);
@@ -699,10 +797,15 @@ pub struct Settings {
   pub self_info: DeviceInfo,
   pub tx_latency_ns: u32,
   pub clock_path: Option<PathBuf>,
+  /// ONS fork: host-supplied clock status for the clock-stats reply. `None` keeps the Linux
+  /// `/tmp/clock-stats.*` file path.
+  pub clock_status: Option<ClockStatusHandle>,
   pub use_safe_clock: bool,
   pub tx_source_bit_depth: u8,
   /// Persistent state directory (see [`SettingsBuilder::state_dir`], [`default_state_dir`]).
   pub state_dir: PathBuf,
+  /// ONS fork: how a rename from a controller is handled.
+  pub naming: DeviceNaming,
 }
 
 impl Settings {
@@ -879,7 +982,7 @@ mod tests {
   fn device_name_rules() {
     for ok in ["ONS-PC", "a", "A1-b2", &"a".repeat(31)] {
       assert!(validate_device_name(ok).is_ok(), "{ok}");
-      assert_eq!(build(base().device_name(ok)).unwrap().self_info.friendly_hostname, ok);
+      assert_eq!(build(base().device_name(ok)).unwrap().self_info.friendly_hostname(), ok);
     }
     for bad in ["", "-a", "a-", "has space", "under_score", "Büro", &"a".repeat(32)] {
       assert!(matches!(validate_device_name(bad), Err(SettingsError::InvalidDeviceName { .. })), "{bad}");
@@ -908,9 +1011,9 @@ mod tests {
         .state_dir(test_state_dir())
         .build_with(&adapters(), || Some(Ipv4Addr::new(192, 168, 50, 7)))
         .unwrap();
-      assert!(validate_device_name(&s.self_info.friendly_hostname).is_ok(), "{app:?}");
+      assert!(validate_device_name(&s.self_info.friendly_hostname()).is_ok(), "{app:?}");
     }
-    assert_eq!(build(base()).unwrap().self_info.friendly_hostname, "Test-App-c0a83207");
+    assert_eq!(build(base()).unwrap().self_info.friendly_hostname(), "Test-App-c0a83207");
   }
 
   #[test]
@@ -1015,7 +1118,7 @@ mod tests {
       None,
     )
     .unwrap();
-    assert_eq!(s.self_info.friendly_hostname, "my name with spaces");
+    assert_eq!(s.self_info.friendly_hostname(), "my name with spaces");
     assert_eq!(s.self_info.process_id, 3);
     assert_eq!(s.self_info.arc_port, 6000);
     assert_eq!(s.self_info.rx_channels.len(), 4);
@@ -1031,7 +1134,7 @@ mod tests {
   #[test]
   fn config_map_keeps_upstream_defaults() {
     let s = from_map(&[], Some(Ipv4Addr::new(192, 168, 50, 7))).unwrap();
-    assert_eq!(s.self_info.friendly_hostname, "App c0a83207");
+    assert_eq!(s.self_info.friendly_hostname(), "App c0a83207");
     assert_eq!(s.self_info.factory_device_id, [0, 0, 192, 168, 50, 7, 0, 0]);
     // my_ip that matches no adapter is accepted (loopback tests rely on this).
     let s = from_map(&[("BIND_IP", "127.0.0.1")], Some(Ipv4Addr::new(127, 0, 0, 1))).unwrap();
@@ -1072,7 +1175,7 @@ mod tests {
   fn legacy_name_is_cut_on_a_char_boundary() {
     let name = "é".repeat(40);
     let s = from_map(&[("NAME", name.as_str())], None).unwrap();
-    assert_eq!(s.self_info.friendly_hostname.chars().count(), 31);
+    assert_eq!(s.self_info.friendly_hostname().chars().count(), 31);
   }
 
   #[test]
@@ -1088,6 +1191,44 @@ mod tests {
     assert_eq!(merged["ALT_PORT"], "8000");
     assert!(!merged.contains_key("OTHER"));
     assert!(!merged.contains_key("STATE_DIR"));
+  }
+
+  #[test]
+  fn naming_defaults_to_the_starting_name_and_persists() {
+    let s = build(base().device_name("My-Device")).unwrap();
+    assert_eq!(s.naming.default_name, "My-Device");
+    assert!(s.naming.persist);
+    assert!(s.naming.on_rename.is_none());
+
+    let s = build(base().device_name("My-Device").default_device_name("ONS-HOST").persist_device_name(false))
+      .unwrap();
+    assert_eq!(s.naming.default_name, "ONS-HOST");
+    assert!(!s.naming.persist);
+    assert!(matches!(
+      build(base().default_device_name("bad name")),
+      Err(SettingsError::InvalidDeviceName { .. })
+    ));
+  }
+
+  #[test]
+  fn latency_range_defaults_to_the_receive_latency_and_can_be_set() {
+    let s = build(base().rx_latency_ns(6_000_000)).unwrap();
+    let c = &s.self_info.capabilities;
+    assert_eq!((c.latency_min_ns, c.latency_max_ns, c.latency_default_ns), (6_000_000, 6_000_000, 6_000_000));
+    assert_eq!(c.board_flags, [0, 0, 0x10, 0]);
+
+    let s = build(base().rx_latency_ns(6_000_000).latency_range(4_000_000, 10_000_000, 10_000_000).board_flags([1, 2, 3, 4]))
+      .unwrap();
+    let c = &s.self_info.capabilities;
+    assert_eq!((c.latency_min_ns, c.latency_max_ns, c.latency_default_ns), (4_000_000, 10_000_000, 10_000_000));
+    assert_eq!(c.board_flags, [1, 2, 3, 4]);
+
+    for (min, max, def) in [(0, 10, 5), (10, 4, 5), (4, 10, 11), (4, 10, 3)] {
+      assert!(
+        matches!(build(base().latency_range(min, max, def)), Err(SettingsError::InvalidSetting { .. })),
+        "{min} {max} {def}"
+      );
+    }
   }
 
   #[test]

@@ -1,4 +1,5 @@
 use super::channels_subscriber::ChannelsSubscriber;
+use super::device_name::{self, DeviceNaming};
 use super::saved_settings::SavedChannelsSettings;
 use super::tx_multicasts::TransmitMulticasts;
 use crate::mdns_client::MdnsClient;
@@ -13,6 +14,7 @@ use crate::net_utils::UdpSocketWrapper;
 use crate::protocol::mcast::make_channel_change_notification;
 use crate::protocol::mcast::MulticastMessage;
 use crate::protocol::proto_arc::*;
+use crate::protocol::proto_device::{device_settings, set_device_name, CODE_REJECTED};
 use crate::protocol::req_resp::HEADER_LENGTH;
 use crate::protocol::req_resp::{self, CODE_OK};
 use crate::state_storage::StateStorage;
@@ -38,9 +40,11 @@ pub async fn run_server(
   mut channels_sub_rx: watch::Receiver<Option<Arc<ChannelsSubscriber>>>,
   flows_tx: Arc<Mutex<Option<FlowsTransmitter>>>,
   tx_multicasts: Arc<Mutex<Option<TransmitMulticasts>>>,
+  naming: DeviceNaming,
   shutdown: BroadcastReceiver<()>,
 ) {
   let mut subscriber = None;
+  let name_storage = state_storage.clone();
   let mut saved_channels = SavedChannelsSettings::load(state_storage, self_info.clone());
   let server = UdpSocketWrapper::new(Some(self_info.ip_address), self_info.arc_port, shutdown).await;
   let mut conn = req_resp::Connection::new(server);
@@ -85,9 +89,27 @@ pub async fn run_server(
         GET_DEVICE_NAME_OPCODE => {
           // device name (used by network-audio-controller)
           let mut buff = ByteBuffer::new();
-          buff.write_bytes(self_info.friendly_hostname.as_bytes());
+          buff.write_bytes(self_info.friendly_hostname().as_bytes());
           buff.write_u8(0);
           conn.respond(buff.as_bytes()).await;
+        }
+
+        set_device_name::OPCODE => {
+          // ONS fork: rename the device (Dante Controller, netaudio `device name`). The reply is the
+          // plain result code with no content; any other code than 1 is a refusal.
+          match device_name::handle_request(
+            request.content(),
+            &naming,
+            &self_info,
+            &name_storage,
+            mdns_server.as_ref(),
+          ) {
+            Ok(_) => conn.respond(&[]).await,
+            Err(e) => {
+              warn!("device rename refused: {e}");
+              conn.respond_with_code(CODE_REJECTED, &[]).await;
+            }
+          }
         }
 
         get_device_names::OPCODE => {
@@ -95,7 +117,7 @@ pub async fn run_server(
           let strings_offset = HEADER_LENGTH;
           bytes.write_bytes(&[0u8; get_device_names::ResponseHeader::SERIALIZED_SIZE]);
           let friendly_hostname_offset = (bytes.get_wpos() + strings_offset).try_into().unwrap();
-          bytes.write_bytes(self_info.friendly_hostname.as_bytes());
+          bytes.write_bytes(self_info.friendly_hostname().as_bytes());
           bytes.write_u8(0);
           let factory_hostname_offset = (bytes.get_wpos() + strings_offset).try_into().unwrap();
           bytes.write_bytes(self_info.factory_hostname.as_bytes());
@@ -612,42 +634,27 @@ pub async fn run_server(
           conn.respond_with_code(code, &response).await;
         }
 
-        0x1100 => {
-          // used by DC
-          // received unknown opcode1 0x1100, content 00130201820482050210021182188219830183028306031003110303802100f08060002200630064
-          // whole packet: "272900320e621100000000130201820482050210021182188219830183028306031003110303802100f08060002200630064"
-
-          // ???
-          // looks like something dependent on active connections
-          let content = [0u8; 110];
-          // XXX: not necessary
-          /* let content = [
-            0x12, 0x12, 0x02, 0x01, 0x00, 0x01, 0x82, 0x04, 0x00, 0x54, 0x82, 0x05, 0x00, 0x58,
-            0x02, 0x10, 0x00, 0x10, 0x02, 0x11, 0x00, 0x10, 0x00, 0x00, 0x82, 0x18, 0x00, 0x00,
-            0x82, 0x19, 0x83, 0x01, 0x00, 0x5c, 0x83, 0x02, 0x00, 0x60, 0x83, 0x06, 0x00, 0x64,
-            0x03, 0x10, 0x00, 0x10, 0x03, 0x11, 0x00, 0x10, 0x03, 0x03, 0x00, 0x02, 0x80, 0x21,
-            0x00, 0x68, 0x00, 0x00, 0x00, 0xf0, 0x00, 0x00, 0x80, 0x60, 0x00, 0x22, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x63, /* 1000000: */ 0x00, 0x0f, 0x42, 0x40, 0x00, 0x0f, 0x42,
-            0x40, 0x00, 0x0f, 0x42, 0x40, 0x01, 0x35, 0xf1, 0xb4, 0x00, 0x0f, 0x42, 0x40, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00,
-          ]; */
-          conn.respond(&content).await;
+        device_settings::QUERY_OPCODE => {
+          // ONS fork: read settings (Dante Controller asks for 18 properties, `netaudio` for 23 or for
+          // none at all). Upstream answered with zeros; now the properties this device has are
+          // filled in. The request names the properties; the layout is in `proto_device`.
+          let ids = device_settings::parse_query(request.content());
+          let values = device_settings::Values::from_device(&self_info);
+          conn.respond(&device_settings::build_query_response(&ids, &values)).await;
         }
-        0x1102 => {
-          // identical for all low channels count devices
-          let content = [0u8; 94];
-          // XXX not necessary
-          /* let content = [
-            /* number of items, 2B: */ 0x00, 0x17, 0x80, 0x20, 0x00, 0x01,
-            0x80, 0x21, 0x00, 0x03, 0x00, 0x22, 0x00, 0x03, 0x00, 0x23, 0x00, 0x03, 0x00, 0x24, 0x00, 0x01,
-            0x02, 0x01, 0x00, 0x03, 0x82, 0x04, 0x00, 0x03, 0x82, 0x05, 0x00, 0x03, 0x02, 0x0a, 0x00, 0x01,
-            0x02, 0x0b, 0x00, 0x01, 0x02, 0x10, 0x00, 0x03, 0x02, 0x11, 0x00, 0x03, 0x02, 0x12, 0x00, 0x03,
-            0x02, 0x13, 0x00, 0x01, 0x02, 0x14, 0x00, 0x01, 0x83, 0x01, 0x00, 0x03, 0x83, 0x06, 0x00, 0x01,
-            0x83, 0x02, 0x00, 0x01, 0x03, 0x10, 0x00, 0x01, 0x03, 0x11, 0x00, 0x01, 0x03, 0x03, 0x00, 0x03,
-            0x83, 0xf0, 0x00, 0x01, 0x06, 0x01, 0x00, 0x01
-          ]; */
-          conn.respond(&content).await;
+        device_settings::SET_OPCODE => {
+          // ONS fork: a controller asks to change a setting (latency, ...). The MVP does not allow it:
+          // the latency is chosen in the ONS GUI while the device is stopped and the sample rate is
+          // fixed. Refuse, and say so once.
+          warn!(
+            "settings change from a controller refused (change the latency in the ONS app): {}",
+            device_settings::describe_set_request(request.content())
+          );
+          conn.respond_with_code(CODE_REJECTED, &[]).await;
+        }
+        device_settings::DIRECTORY_OPCODE => {
+          // ONS fork: which settings exist and whether they are writable (all read-only here).
+          conn.respond(&device_settings::build_directory_response()).await;
         }
         0x3300 => {
           // WTF: this is necessary to avoid 'clock domain mismatch' error in DC

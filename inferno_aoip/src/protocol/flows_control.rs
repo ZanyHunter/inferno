@@ -120,7 +120,7 @@ impl FlowsControlClient {
     let mut strings = ByteBuffer::new();
     let strings_offset = 0x26 + channels.len() * 2 + HEADER_LENGTH;
     body.write_u16(strings_offset as u16);
-    strings.write_bytes(self.self_info.friendly_hostname.as_bytes());
+    strings.write_bytes(self.self_info.friendly_hostname().as_bytes());
     strings.write_u8(0);
     let rx_flow_name_offset = (strings.get_wpos() + strings_offset) as u16;
     strings.write_bytes(rx_flow_name.as_bytes());
@@ -216,7 +216,7 @@ mod tests {
       factory_device_id: [0; 8],
       process_id: 0,
       vendor_string: String::new(),
-      friendly_hostname: String::new(),
+      friendly_hostname: Default::default(),
       factory_hostname: String::new(),
       rx_channels: Vec::new(),
       tx_channels: Vec::new(),
@@ -224,6 +224,7 @@ mod tests {
       pcm_type: 0,
       latency_ns: 0,
       sample_rate: 0,
+      capabilities: crate::device_info::DeviceCapabilities::fixed_latency(0),
       arc_port: 0,
       cmc_port: 0,
       flows_control_port: 0,

@@ -1,7 +1,7 @@
 use super::channels_subscriber::ChannelsSubscriber;
 use crate::byte_utils::*;
 use crate::common::*;
-use crate::media_clock::MediaClock;
+use crate::media_clock::{ClockStatusHandle, MediaClock};
 use crate::net_utils::UdpSocketWrapper;
 use crate::protocol::mcast::{make_packet, MulticastMessage};
 use crate::{byte_utils::write_str_to_buffer, device_info::DeviceInfo};
@@ -27,6 +27,88 @@ const DST_PORT_DEVICE_INFO: u16 = 8702;
 
 pub type PeaksCallback = Box<dyn FnMut() -> (Vec<u8>, Vec<u8>) + Send + Sync>;
 
+// Flags word (two u16) of the clock-stats reply, as observed on the wire from a Mac Dante Virtual
+// Soundcard on 2026-11-01 (the second word's bit 0x0002 means "locked"; the upstream source comment
+// that said `0x01 = PLL not locked` was wrong):
+//
+//   state                                      flags         freq offset     master id
+//   following a master and synced              00 03 00 03   small, in ppb   the leader
+//   just acquired a master, not yet locked     00 03 00 01   0               the leader
+//   no leader (reports itself as master)       00 01 00 06   -               its own MAC + 0000
+//
+// The not-locked row was seen twice, about 2 s before the device flipped to `00 03 00 03`. ONS sends
+// nothing when there is no leader instead of the `00 01 00 06` self-master form.
+
+/// Following a master and locked to it. The value upstream Inferno always sent.
+const CLOCK_STATS_FLAGS_PLL_LOCKED: [u8; 4] = [0x00, 0x03, 0x00, 0x03];
+/// Following a master but not locked yet; sent with a frequency offset of 0.
+const CLOCK_STATS_FLAGS_PLL_NOT_LOCKED: [u8; 4] = [0x00, 0x03, 0x00, 0x01];
+
+/// Flags word of the clock-stats reply for a host clock that is or is not locked.
+fn clock_stats_flags(locked: bool) -> [u8; 4] {
+  if locked {
+    CLOCK_STATS_FLAGS_PLL_LOCKED
+  } else {
+    CLOCK_STATS_FLAGS_PLL_NOT_LOCKED
+  }
+}
+
+/// Content of the clock-stats reply (opcode `07 2a 00 20`), same layout as upstream Inferno:
+/// flags word, `00 00 00 9f`, frequency offset in ppb (i32), our MAC, two zero bytes, the grandmaster id
+/// twice, 76 zero bytes.
+fn clock_stats_content(flags: [u8; 4], freq_offset_ppb: i32, mac: [u8; 6], master_clock: [u8; 8]) -> Vec<u8> {
+  let mut bytes = ByteBuffer::new();
+  bytes.set_endian(bytebuffer::Endian::BigEndian);
+  bytes.write_bytes(&flags);
+  bytes.write_bytes(&[0x00, 0x00, 0x00, 0x9f /* was 0xff */]);
+  bytes.write_i32(freq_offset_ppb);
+  bytes.write_bytes(&mac);
+  bytes.write_u16(0);
+  bytes.write_bytes(&master_clock);
+  bytes.write_bytes(&master_clock);
+  bytes.write_bytes(&[0u8; 76]);
+  bytes.as_bytes().to_vec()
+}
+
+/// Upstream's source of the grandmaster id: the first 16 hex digits of `/tmp/clock-stats.<mac>0000*`,
+/// written by a Linux PTP helper. Never present on Windows.
+fn clock_stats_master_from_tmp_file(mac: &[u8; 6]) -> Option<[u8; 8]> {
+  let required_prefix = format!("clock-stats.{}0000", hex::encode(mac));
+  for entry in std::fs::read_dir("/tmp").ok()?.flatten() {
+    if entry.file_name().to_string_lossy().starts_with(&required_prefix) {
+      if let Ok(content) = std::fs::read_to_string(entry.path()) {
+        let id = content.trim_ascii().get(0..16).and_then(|h| hex::decode(h).ok());
+        if let Some(id) = id.and_then(|v| <[u8; 8]>::try_from(v).ok()) {
+          return Some(id);
+        }
+      }
+    }
+  }
+  None
+}
+
+/// Content of a sample rate or encoding status reply (opcodes `07 2a 00 80` and `07 2a 00 82`), ONS fork:
+/// offset of the value list counted from the opcode (`0x18`), number of values, current value, requested
+/// value, update mode, flags, then the supported values (all `u32`, big endian).
+///
+/// The update mode is 0 = fixed: the device does not let a controller change it (the layout and the
+/// mode meanings were checked against `netaudio`'s parser; Inferno's source quotes a hardware reply with
+/// mode 2 and four sample rates).
+fn capability_status_content(current: u32, supported: &[u32]) -> Vec<u8> {
+  const UPDATE_MODE_FIXED: u16 = 0;
+  let mut c = Vec::with_capacity(16 + 4 * supported.len());
+  c.extend_from_slice(&0x18u16.to_be_bytes());
+  c.extend_from_slice(&(supported.len() as u16).to_be_bytes());
+  c.extend_from_slice(&current.to_be_bytes());
+  c.extend_from_slice(&current.to_be_bytes());
+  c.extend_from_slice(&UPDATE_MODE_FIXED.to_be_bytes());
+  c.extend_from_slice(&0u16.to_be_bytes());
+  for v in supported {
+    c.extend_from_slice(&v.to_be_bytes());
+  }
+  c
+}
+
 struct Multicaster<'s> {
   self_info: &'s DeviceInfo,
   pub server: UdpSocketWrapper,
@@ -41,6 +123,7 @@ struct Multicaster<'s> {
   channels_subscriber: Option<Arc<ChannelsSubscriber>>,
   get_peaks: PeaksCallback,
   had_clock: bool,
+  host_clock_status: Option<ClockStatusHandle>,
 }
 
 impl<'s> Multicaster<'s> {
@@ -48,6 +131,7 @@ impl<'s> Multicaster<'s> {
     self_info: &'s DeviceInfo,
     server: UdpSocketWrapper,
     clock: Arc<RwLock<MediaClock>>,
+    host_clock_status: Option<ClockStatusHandle>,
     get_peaks: PeaksCallback,
   ) -> Multicaster {
     let patch_version = env!("CARGO_PKG_VERSION_PATCH").parse::<u16>().unwrap();
@@ -76,6 +160,7 @@ impl<'s> Multicaster<'s> {
       channels_subscriber: None,
       get_peaks,
       had_clock: false,
+      host_clock_status,
     };
     write_str_to_buffer(&mut r.vendor, 0, 8, &self_info.vendor_string);
     return r;
@@ -121,10 +206,9 @@ impl<'s> Multicaster<'s> {
     //       0x10 - has Manufacturer name
     //       0x40 - Network is configurable (supports static addressing)
     // 0x17: Identify device, Sample rate & encoding configuration, Reboot, Factory reset (was 0xdb)
-    content[0x14] = 0;
-    content[0x15] = 0;
-    content[0x16] = 0x10;
-    content[0x17] = 0;
+    // ONS fork: the host can choose the flags (`SettingsBuilder::board_flags`); the default is the
+    // upstream value [0, 0, 0x10, 0].
+    content[0x14..0x18].copy_from_slice(&self.self_info.capabilities.board_flags);
 
     content[0xbb] = 0x1f; // if 0, device is flooded with info multicast requests around 1 per second
                           /* content[0xbf] = 5;
@@ -134,6 +218,19 @@ impl<'s> Multicaster<'s> {
     write_str_to_buffer(&mut content, 0x38, 16, &self.self_info.board_name);
 
     self.send(self.device_info_destination, 0xffff, [0x07, 0x2a, 0x00, 0x60, 0, 0, 0, 0], &content).await;
+  }
+
+  /// Reply to a sample rate status request (`07 xx 00 81`): opcode `07 2a 00 80`.
+  async fn send_sample_rate_status(&mut self) {
+    let content = capability_status_content(self.self_info.sample_rate, &[self.self_info.sample_rate]);
+    self.send(self.device_info_destination, 0xffff, [0x07, 0x2a, 0x00, 0x80, 0, 0, 0, 0], &content).await;
+  }
+
+  /// Reply to an encoding status request (`07 xx 00 83`): opcode `07 2a 00 82`.
+  async fn send_encoding_status(&mut self) {
+    let bits = u32::from(self.self_info.bits_per_sample);
+    let content = capability_status_content(bits, &[bits]);
+    self.send(self.device_info_destination, 0xffff, [0x07, 0x2a, 0x00, 0x82, 0, 0, 0, 0], &content).await;
   }
 
   async fn send_product_info(&mut self) {
@@ -310,48 +407,32 @@ impl<'s> Multicaster<'s> {
     } else {
       return;
     };
-    let required_prefix = format!("clock-stats.{}0000", hex::encode(self.self_info.mac_address.octets()));
-    let mut master_clock = None;
-    if let Ok(readdir) = std::fs::read_dir("/tmp") {
-      for entry in readdir {
-        if let Ok(entry) = entry {
-          if entry.file_name().to_string_lossy().starts_with(&required_prefix) {
-            if let Ok(content) = std::fs::read_to_string(entry.path()) {
-              let content = content.trim_ascii();
-              if content.len() >= 12 {
-                if let Ok(master_id) = hex::decode(&content[0..16]) {
-                  master_clock = Some(master_id);
-                  break;
-                }
-              }
-            }
-          }
+    let mac = self.self_info.mac_address.octets();
+    // ONS fork: the host-supplied status wins when there is one; the Linux file is the fallback.
+    let (mc, flags, freq_offset) = match &self.host_clock_status {
+      Some(handle) => {
+        let status = handle.get();
+        match status.master_clock_id {
+          // A DVS that follows a master but is not locked yet reports a frequency offset of 0.
+          Some(id) => (id, clock_stats_flags(status.locked), if status.locked { freq_offset } else { 0 }),
+          None => return, // no leader followed: stay silent, Dante Controller shows the clock red
         }
       }
-    }
-    if let Some(mc) = master_clock {
-      assert_eq!(mc.len(), 8);
-      let mut bytes = ByteBuffer::new();
-      bytes.set_endian(bytebuffer::Endian::BigEndian);
-      bytes.write_bytes(&[
-        0x00, 0x03, 0x00, 0x03, /* 0x01 = PLL not locked */
-        0x00, 0x00, 0x00, 0x9f, /* was 0xff */
-      ]);
-      bytes.write_i32(freq_offset);
-      bytes.write_bytes(&self.self_info.mac_address.octets());
-      bytes.write_u16(0);
-      bytes.write_bytes(&mc);
-      bytes.write_bytes(&mc);
-      bytes.write_bytes(&[0u8; 76]);
-      self
-        .send(
-          self.device_info_destination,
-          0xffff,
-          [0x07, 0x2a, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00],
-          bytes.as_bytes(),
-        )
-        .await;
-    }
+      None => match clock_stats_master_from_tmp_file(&mac) {
+        // The file carries no lock information: send the historic flags word unchanged.
+        Some(id) => (id, CLOCK_STATS_FLAGS_PLL_LOCKED, freq_offset),
+        None => return,
+      },
+    };
+    let content = clock_stats_content(flags, freq_offset, mac, mc);
+    self
+      .send(
+        self.device_info_destination,
+        0xffff,
+        [0x07, 0x2a, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00],
+        &content,
+      )
+      .await;
   }
 
   async fn send_network_info(&mut self) {
@@ -385,6 +466,7 @@ pub async fn run_server(
   self_info: Arc<DeviceInfo>,
   mut rx: mpsc::Receiver<MulticastMessage>,
   clock: Arc<RwLock<MediaClock>>,
+  host_clock_status: Option<ClockStatusHandle>,
   mut channels_sub_rx: watch::Receiver<Option<Arc<ChannelsSubscriber>>>,
   get_peaks: PeaksCallback,
   shutdown: BroadcastReceiver<()>,
@@ -392,7 +474,7 @@ pub async fn run_server(
   let server =
     UdpSocketWrapper::new(Some(self_info.ip_address), self_info.info_request_port, shutdown).await;
   let mut recv_buff = crate::net_utils::ReceiveBuffer::new();
-  let mut mcaster = Multicaster::new(self_info.as_ref(), server, clock, get_peaks);
+  let mut mcaster = Multicaster::new(self_info.as_ref(), server, clock, host_clock_status, get_peaks);
   mcaster.send_board_info().await;
   mcaster.send_product_info().await;
   let mut heartbeat_interval = interval(Duration::from_secs(1));
@@ -415,6 +497,12 @@ pub async fn run_server(
           },
           [0x07, _, 0, 0xc1, 0, 0, 0, 0] => {
             mcaster.send_product_info().await;
+          },
+          [0x07, _, 0, 0x81, 0, 0, 0, _] => {
+            mcaster.send_sample_rate_status().await;
+          },
+          [0x07, _, 0, 0x83, 0, 0, 0, _] => {
+            mcaster.send_encoding_status().await;
           },
           [0x07, _ /* was 0x38 */, 0, 0x21, 0, 0, 0, _ /* was 0x64 */] => {
             mcaster.send_clock_stats().await;
@@ -450,5 +538,203 @@ pub async fn run_server(
       }
       // TODO receive shutdown properly, currently Ctrl-C doesn't work if there is error binding to socket
     };
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::media_clock::{ClockOverlay, HostClockStatus};
+  use netdev::mac::MacAddr;
+  use tokio::net::UdpSocket;
+  use tokio::sync::broadcast;
+
+  const MAC: [u8; 6] = [0x02, 0x4f, 0x4e, 0x53, 0x13, 0x36];
+  const MASTER: [u8; 8] = [0x00, 0x1d, 0xc1, 0x20, 0x51, 0xf0, 0x00, 0x00];
+
+  fn test_info() -> DeviceInfo {
+    DeviceInfo {
+      ip_address: Ipv4Addr::LOCALHOST,
+      netmask: Ipv4Addr::UNSPECIFIED,
+      gateway: Ipv4Addr::UNSPECIFIED,
+      mac_address: MacAddr::new(MAC[0], MAC[1], MAC[2], MAC[3], MAC[4], MAC[5]),
+      link_speed: 1000,
+      board_name: String::new(),
+      manufacturer: String::new(),
+      model_name: String::new(),
+      model_number: String::new(),
+      factory_device_id: [1, 2, 3, 4, 5, 6, 7, 8],
+      process_id: 9,
+      vendor_string: String::new(),
+      friendly_hostname: Default::default(),
+      factory_hostname: String::new(),
+      rx_channels: Vec::new(),
+      tx_channels: Vec::new(),
+      bits_per_sample: 24,
+      pcm_type: 0xe,
+      latency_ns: 0,
+      sample_rate: 48_000,
+      capabilities: crate::device_info::DeviceCapabilities::fixed_latency(0),
+      arc_port: 0,
+      cmc_port: 0,
+      flows_control_port: 0,
+      info_request_port: 0,
+    }
+  }
+
+  fn running_clock() -> Arc<RwLock<MediaClock>> {
+    let mut clock = MediaClock::new(false);
+    clock.update_overlay(ClockOverlay { clock_id: 1, last_sync: 0, shift: 0, freq_scale: 12.5e-6 });
+    Arc::new(RwLock::new(clock))
+  }
+
+  /// Runs `send_clock_stats` on a `Multicaster` whose "device info group" is a loopback socket (nothing
+  /// leaves the machine) and returns the datagram it produced, if any.
+  async fn clock_stats_reply(
+    host: Option<ClockStatusHandle>,
+    clock: Arc<RwLock<MediaClock>>,
+  ) -> (Option<Vec<u8>>, Option<i32>) {
+    let info = test_info();
+    let (_shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let server = UdpSocketWrapper::new(Some(Ipv4Addr::LOCALHOST), 0, shutdown_rx).await;
+    let mut mcaster = Multicaster::new(&info, server, clock, host, Box::new(|| (vec![], vec![])));
+    let sink = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    mcaster.device_info_destination = sink.local_addr().unwrap();
+    let freq_offset = mcaster.get_freq_offset_ppb();
+    mcaster.send_clock_stats().await;
+    let mut buf = [0u8; 1500];
+    let got = tokio::time::timeout(Duration::from_millis(300), sink.recv_from(&mut buf)).await;
+    (got.ok().map(|r| buf[..r.unwrap().0].to_vec()), freq_offset)
+  }
+
+  #[tokio::test]
+  async fn host_status_gives_clock_stats_with_master_mac_offset_and_locked_flag() {
+    let handle = ClockStatusHandle::new();
+    handle.set(HostClockStatus { master_clock_id: Some(MASTER), locked: true });
+    let (pkt, freq_offset) = clock_stats_reply(Some(handle), running_clock()).await;
+    let pkt = pkt.expect("a clock-stats reply");
+    let freq_offset = freq_offset.expect("clock has an overlay");
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(freq_offset, 12_500);
+
+    assert_eq!(pkt.len(), 32 + 112);
+    assert_eq!(&pkt[0..2], &[0xff, 0xff], "start code");
+    assert_eq!(u16::from_be_bytes([pkt[2], pkt[3]]) as usize, pkt.len());
+    assert_eq!(&pkt[8..16], &[1, 2, 3, 4, 5, 6, 7, 8], "factory device id");
+    assert_eq!(&pkt[24..32], &[0x07, 0x2a, 0x00, 0x20, 0, 0, 0, 0], "opcode");
+    let c = &pkt[32..];
+    assert_eq!(&c[0..4], &CLOCK_STATS_FLAGS_PLL_LOCKED);
+    // As observed from a Mac DVS following a master and synced (2026-11-01).
+    assert_eq!(c[0..4], [0x00, 0x03, 0x00, 0x03]);
+    assert_eq!(&c[4..8], &[0x00, 0x00, 0x00, 0x9f]);
+    assert_eq!(&c[8..12], &freq_offset.to_be_bytes());
+    assert_eq!(&c[12..18], &MAC);
+    assert_eq!(&c[18..20], &[0, 0]);
+    assert_eq!(&c[20..28], &MASTER);
+    assert_eq!(&c[28..36], &MASTER);
+    assert!(c[36..].iter().all(|b| *b == 0));
+  }
+
+  #[tokio::test]
+  async fn unlocked_host_status_sends_the_not_locked_flags_and_a_zero_offset() {
+    let handle = ClockStatusHandle::new();
+    handle.set(HostClockStatus { master_clock_id: Some(MASTER), locked: false });
+    // The clock has a non-zero frequency offset; a not-locked reply must still carry 0.
+    let (pkt, freq_offset) = clock_stats_reply(Some(handle), running_clock()).await;
+    assert_ne!(freq_offset, Some(0));
+    let pkt = pkt.expect("a clock-stats reply");
+    let c = &pkt[32..];
+    // As observed from a Mac DVS that had just acquired a master (2026-11-01).
+    assert_eq!(&c[0..4], &[0x00, 0x03, 0x00, 0x01]);
+    assert_eq!(&c[0..4], &CLOCK_STATS_FLAGS_PLL_NOT_LOCKED);
+    assert_eq!(&c[4..8], &[0x00, 0x00, 0x00, 0x9f]);
+    assert_eq!(&c[8..12], &0i32.to_be_bytes());
+    assert_eq!(&c[12..18], &MAC);
+    assert_eq!(&c[20..28], &MASTER);
+    assert_eq!(&c[28..36], &MASTER);
+    // Locked is the historic word.
+    assert_eq!(clock_stats_flags(true), [0x00, 0x03, 0x00, 0x03]);
+  }
+
+  #[tokio::test]
+  async fn no_leader_sends_nothing_and_updates_are_seen() {
+    let handle = ClockStatusHandle::new();
+    // Default: no leader.
+    let (pkt, _) = clock_stats_reply(Some(handle.clone()), running_clock()).await;
+    assert!(pkt.is_none(), "nothing may be sent without a leader");
+
+    handle.set(HostClockStatus { master_clock_id: Some(MASTER), locked: true });
+    let (pkt, _) = clock_stats_reply(Some(handle.clone()), running_clock()).await;
+    assert!(pkt.is_some());
+
+    // The leader stops: back to silence.
+    handle.set(HostClockStatus::default());
+    let (pkt, _) = clock_stats_reply(Some(handle), running_clock()).await;
+    assert!(pkt.is_none());
+  }
+
+  #[tokio::test]
+  async fn no_clock_overlay_sends_nothing() {
+    let handle = ClockStatusHandle::new();
+    handle.set(HostClockStatus { master_clock_id: Some(MASTER), locked: true });
+    let clock = Arc::new(RwLock::new(MediaClock::new(false)));
+    let (pkt, freq_offset) = clock_stats_reply(Some(handle), clock).await;
+    assert!(freq_offset.is_none());
+    assert!(pkt.is_none());
+  }
+
+  /// Sent datagrams of one reply method, captured on a loopback socket.
+  async fn capture(
+    info: &DeviceInfo,
+    send: impl for<'a, 'b> FnOnce(&'a mut Multicaster<'b>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>,
+  ) -> Vec<u8> {
+    let (_shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let server = UdpSocketWrapper::new(Some(Ipv4Addr::LOCALHOST), 0, shutdown_rx).await;
+    let mut mcaster = Multicaster::new(info, server, running_clock(), None, Box::new(|| (vec![], vec![])));
+    let sink = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    mcaster.device_info_destination = sink.local_addr().unwrap();
+    send(&mut mcaster).await;
+    let mut buf = [0u8; 1500];
+    let (n, _) = tokio::time::timeout(Duration::from_millis(300), sink.recv_from(&mut buf))
+      .await
+      .expect("a reply")
+      .unwrap();
+    buf[..n].to_vec()
+  }
+
+  /// The sample rate reply of a fixed 48 kHz device; layout checked against `netaudio`'s parser.
+  #[tokio::test]
+  async fn sample_rate_status_reports_a_fixed_48k() {
+    let pkt = capture(&test_info(), |m| Box::pin(m.send_sample_rate_status())).await;
+    assert_eq!(&pkt[24..32], &[0x07, 0x2a, 0x00, 0x80, 0, 0, 0, 0]);
+    assert_eq!(
+      &pkt[32..],
+      &[0x00, 0x18, 0x00, 0x01, 0, 0, 0xbb, 0x80, 0, 0, 0xbb, 0x80, 0x00, 0x00, 0x00, 0x00, 0, 0, 0xbb, 0x80]
+    );
+  }
+
+  #[tokio::test]
+  async fn encoding_status_reports_fixed_24_bit() {
+    let pkt = capture(&test_info(), |m| Box::pin(m.send_encoding_status())).await;
+    assert_eq!(&pkt[24..32], &[0x07, 0x2a, 0x00, 0x82, 0, 0, 0, 0]);
+    assert_eq!(&pkt[32..], &[0x00, 0x18, 0x00, 0x01, 0, 0, 0, 24, 0, 0, 0, 24, 0, 0, 0, 0, 0, 0, 0, 24]);
+  }
+
+  #[tokio::test]
+  async fn board_info_carries_the_capability_flags_of_the_device() {
+    let mut info = test_info();
+    let default_pkt = capture(&info, |m| Box::pin(m.send_board_info())).await;
+    assert_eq!(&default_pkt[32 + 0x14..32 + 0x18], &[0, 0, 0x10, 0], "upstream default");
+    info.capabilities.board_flags = [0x01, 0x50, 0x10, 0x00];
+    let pkt = capture(&info, |m| Box::pin(m.send_board_info())).await;
+    assert_eq!(&pkt[32 + 0x14..32 + 0x18], &[0x01, 0x50, 0x10, 0x00]);
+  }
+
+  #[tokio::test]
+  async fn without_a_host_handle_the_tmp_file_path_is_used() {
+    // No such file for this MAC: nothing is sent (and on Windows /tmp does not even exist).
+    let (pkt, _) = clock_stats_reply(None, running_clock()).await;
+    assert!(pkt.is_none());
+    assert_eq!(clock_stats_master_from_tmp_file(&MAC), None);
   }
 }
