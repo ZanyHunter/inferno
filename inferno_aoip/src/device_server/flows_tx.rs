@@ -223,10 +223,16 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
       if lag > max_lag_samples as ClockDiff {
         error!("tx lag of {} samples detected, or media clock jumped, dropout occurs!", lag);
         flow.bootstrap_next_ts(now);
+        // ONS fork: the keepalive deadline is a media time too. After a clock step it is on the old
+        // timeline, and a step to a later time (a leader with a longer uptime) puts it in the past, so
+        // the expiry check below would take the flow out of service before its receiver's next
+        // keepalive can arrive.
+        flow.keep_alive(now as Clock, sample_rate);
       }
       if lag < -(DISCONTINUITY_THRESHOLD_SAMPLES as ClockDiff) {
         error!("media clock jumped: {}", lag);
         flow.bootstrap_next_ts(now);
+        flow.keep_alive(now as Clock, sample_rate);
       }
       pbuff[9..9 + stride * flow.fpp].fill(0);
       while wrapped_diff(now as Clock, flow.next_ts as Clock) >= 0 {
@@ -555,6 +561,8 @@ pub struct FlowsTransmitter {
   /// Shared with the thread; see `FlowsTransmitterInternal::stop`.
   stop: Arc<AtomicBool>,
   flows_info: Vec<Option<FlowInfo>>,
+  /// Number of channels the TX thread has a source for.
+  channels_count: usize,
 }
 
 /// ONS fork: dropping the handle ends the thread, whatever state its command queue or media clock is in.
@@ -624,6 +632,7 @@ impl FlowsTransmitter {
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let srate = self_info.sample_rate;
+    let channels_count = channels_outputs.len();
     // TODO dehardcode latency_ns
     let thread_join = run_future_in_new_thread("flows TX", move || {
       Self::run(
@@ -652,6 +661,7 @@ impl FlowsTransmitter {
         flows: BTreeMap::new(),
         ip_port_to_id: BTreeMap::new(),
         flows_info: (0..MAX_FLOWS).map(|_| None).collect_vec(),
+        channels_count,
       },
       thread_join,
     );
@@ -660,6 +670,22 @@ impl FlowsTransmitter {
     // ONS fork: the flag works even when the queue is not being read; the command wakes an idle thread.
     self.stop.store(true, Ordering::Release);
     self.commands_sender.send(Command::Shutdown).await.log_and_forget();
+  }
+
+  /// ONS fork: a channel index beyond our transmit channels would be an out of bounds access in the TX
+  /// thread, which ends it and with it every flow. Treat such a slot as unconnected (silence).
+  fn valid_channels(&self, wanted: &[Option<usize>]) -> Vec<Option<usize>> {
+    let count = self.channels_count;
+    wanted
+      .iter()
+      .map(|&ch| match ch {
+        Some(index) if index >= count => {
+          error!("flow wants TX channel index {index}, but there are only {count}: sending silence");
+          None
+        }
+        other => other,
+      })
+      .collect()
   }
 
   pub fn destination_exists(&self, dst_addr: Ipv4Addr, dst_port: u16) -> bool {
@@ -674,7 +700,7 @@ impl FlowsTransmitter {
     requested_flow_index: Option<u32>,
     is_multicast: bool,
   ) -> Result<(usize, FlowHandle), std::io::Error> {
-    let channel_indices = flow_info.local_channel_indices.clone();
+    let channel_indices = self.valid_channels(&flow_info.local_channel_indices);
     let dst_addr = SocketAddr::new(IpAddr::V4(flow_info.dst_addr), flow_info.dst_port);
     let (flow_index, cookie) = match self.ip_port_to_id.get(&dst_addr) {
       None => {
@@ -811,7 +837,7 @@ impl FlowsTransmitter {
     channel_indices: impl IntoIterator<Item = Option<usize>>,
   ) -> Result<usize, std::io::Error> {
     if let Some((index, _)) = self.get_flow(handle) {
-      let channel_indices = channel_indices.into_iter().collect_vec();
+      let channel_indices = self.valid_channels(&channel_indices.into_iter().collect_vec());
       self
         .commands_sender
         .send(Command::SetChannels { index: index as usize, channel_indices: channel_indices.clone() })
@@ -945,13 +971,23 @@ mod tests {
 
   /// Runs the transmitter the way its thread does, about once a millisecond, for `duration`.
   fn run_for(t: &mut Internal, duration: Duration) {
+    run_for_with(t, duration, false);
+  }
+
+  /// Like [`run_for`], and with `process_events` the keepalive deadlines are checked on every pass (none
+  /// of the test flows ever receive a keepalive).
+  fn run_for_with(t: &mut Internal, duration: Duration, process_events: bool) {
     let mut rng = SmallRng::seed_from_u64(1);
     let end = std::time::Instant::now() + duration;
     while std::time::Instant::now() < end {
       let now = t.now().unwrap();
-      t.transmit(&mut rng, now, false);
+      t.transmit(&mut rng, now, process_events);
       std::thread::sleep(Duration::from_millis(1));
     }
+  }
+
+  fn expired(t: &Internal, index: usize) -> bool {
+    t.flows[index].as_ref().unwrap().expired.load(Ordering::Relaxed)
   }
 
   #[test]
@@ -1015,5 +1051,51 @@ mod tests {
     assert!(!seconds.is_empty());
     let want = (LEADER_A_NS / 1_000_000_000) as u32;
     assert!(seconds.iter().all(|s| (want..want + UPTIME_SLACK_S).contains(s)), "{seconds:?}");
+  }
+
+  /// Issue #127: flows created before the media clock steps to the leader's timeline (the first servo step
+  /// comes a fraction of a second after the first flow request) must keep transmitting after it. The
+  /// keepalive deadline of such a flow was left on the old timeline, so when the leader's time is later
+  /// than ours the deadline was "in the past" and the flow was taken out of service on the next pass,
+  /// before any keepalive could arrive.
+  #[test]
+  fn flows_created_before_a_clock_step_forward_keep_transmitting() {
+    let mut t = internal(None);
+    let receivers: Vec<_> = (0..4).map(|i| add_flow(&mut t, i, true)).collect();
+    run_for_with(&mut t, Duration::from_millis(20), true);
+    for rx in &receivers {
+      assert!(!packet_seconds(rx).is_empty());
+    }
+
+    t.clock.update_overlay(overlay(LEADER_A_NS));
+    run_for_with(&mut t, Duration::from_millis(60), true);
+    let want = (LEADER_A_NS / 1_000_000_000) as u32;
+    for (i, rx) in receivers.iter().enumerate() {
+      assert!(!expired(&t, i), "flow {i} was expired by the clock step");
+      let seconds = packet_seconds(rx);
+      assert!(seconds.len() > 10, "flow {i}: {} packets after the step", seconds.len());
+      assert!(seconds.iter().all(|&s| s >= want), "flow {i}: {seconds:?}");
+    }
+  }
+
+  #[test]
+  fn flows_created_before_a_clock_step_back_keep_transmitting() {
+    let mut t = internal(None);
+    t.clock.update_overlay(overlay(LEADER_A_NS));
+    let receivers: Vec<_> = (0..4).map(|i| add_flow(&mut t, i, true)).collect();
+    run_for_with(&mut t, Duration::from_millis(20), true);
+    for rx in &receivers {
+      assert!(!packet_seconds(rx).is_empty());
+    }
+
+    t.clock.update_overlay(overlay(0));
+    run_for_with(&mut t, Duration::from_millis(60), true);
+    let before = (LEADER_A_NS / 1_000_000_000) as u32;
+    for (i, rx) in receivers.iter().enumerate() {
+      assert!(!expired(&t, i), "flow {i} was expired by the clock step");
+      let seconds = packet_seconds(rx);
+      assert!(seconds.len() > 10, "flow {i}: {} packets after the step", seconds.len());
+      assert!(seconds.iter().all(|&s| s < before), "flow {i}: {seconds:?}");
+    }
   }
 }
