@@ -883,6 +883,29 @@ impl FlowsTransmitter {
   pub fn get_flows_info(&self) -> &Vec<Option<FlowInfo>> {
     &self.flows_info
   }
+  /// ONS fork (ONS #171): for each of our transmit channels, how many receive channels of other devices
+  /// are subscribed to it through a unicast flow. A receiver that subscribes two of its channels to the
+  /// same transmit channel counts twice. Flows that expired (no keepalives for `KEEPALIVE_TIMEOUT_SECONDS`)
+  /// are left out, and so are multicast flows, whose receivers are not known to us.
+  pub fn channel_subscriber_counts(&self) -> Vec<u32> {
+    let mut counts = vec![0u32; self.self_info.tx_channels.len()];
+    for (index, info) in self.flows_info.iter().enumerate() {
+      let Some(info) = info else { continue };
+      if info.is_multicast() {
+        continue;
+      }
+      let live = self.flows.get(&(index as u32)).is_some_and(|flow| !flow.expired.load(Ordering::Acquire));
+      if !live {
+        continue;
+      }
+      for &ch in info.local_channel_indices.iter().flatten() {
+        if let Some(count) = counts.get_mut(ch) {
+          *count += 1;
+        }
+      }
+    }
+    counts
+  }
 }
 
 #[cfg(test)]
