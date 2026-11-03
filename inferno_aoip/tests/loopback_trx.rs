@@ -248,6 +248,17 @@ async fn test_loopback_trx() {
 
   tokio::time::sleep(Duration::from_secs(2)).await;
 
+  // ONS fork (ONS #171): both ends report the two subscriptions.
+  let rx_subscriptions = rx_server.subscriptions_view().rx_subscriptions();
+  assert_eq!(rx_subscriptions.len(), 2);
+  for (ch, sub) in rx_subscriptions.iter().enumerate() {
+    let sub = sub.as_ref().expect("RX channel is subscribed");
+    assert_eq!(sub.tx_channel_name, format!("TX {}", ch + 1));
+    assert_eq!(sub.tx_hostname, tx_hostname);
+    assert!(sub.status.is_receiving(), "RX {ch}: {:?}", sub.status);
+  }
+  assert_eq!(tx_server.subscriptions_view().tx_subscriber_counts(), Some(vec![1, 1]));
+
   rx_server.shutdown().await;
   tx_server.shutdown().await;
   clock_running.store(false, Ordering::Relaxed);

@@ -46,6 +46,7 @@ pub use crate::media_clock::{
   ClockOverlay, ClockPublisher, ClockStatusHandle, HostClockStatus, MediaClock, RealTimeClockReceiver,
 };
 pub use crate::ring_buffer::{new_owned, ExternalBufferParameters, PositionReportDestination, RBInput};
+pub use channels_subscriber::{SubscriptionInfo, SubscriptionStatus};
 pub use device_name::{DeviceNaming, DeviceRename, RenameCallback};
 pub use settings::{
   default_state_dir, program_data_state_dir, sanitize_device_name, validate_device_name, NicInfo, NicSelector,
@@ -117,7 +118,51 @@ pub struct DeviceServer {
   rx_shutdown_todo: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
 
+/// ONS fork (ONS #171): a cloneable, read-only view of who is subscribed to this device, for a host that
+/// reports it (a status display). It does not borrow the [`DeviceServer`], so it can outlive the borrow
+/// and be called from any thread (also outside the async runtime). Take it with
+/// [`DeviceServer::subscriptions_view`] after the receiver and transmitter were started.
+#[derive(Clone)]
+pub struct SubscriptionsView {
+  rx: Option<Arc<ChannelsSubscriber>>,
+  rx_channels: usize,
+  flows_tx: Arc<Mutex<Option<FlowsTransmitter>>>,
+}
+
+impl SubscriptionsView {
+  /// The subscription of each of our receive channels (index = channel), `None` for a channel that is
+  /// not subscribed. Empty while the receiver is not started.
+  pub fn rx_subscriptions(&self) -> Vec<Option<SubscriptionInfo>> {
+    match &self.rx {
+      Some(sub) => (0..self.rx_channels).map(|ch| sub.channel_status(ch)).collect(),
+      None => Vec::new(),
+    }
+  }
+
+  /// How many receive channels of other devices are subscribed to each of our transmit channels (see
+  /// `FlowsTransmitter::channel_subscriber_counts`). `None` while the transmitter is not started, or when
+  /// the flow table is in use for longer than a few microseconds (ask again).
+  pub fn tx_subscriber_counts(&self) -> Option<Vec<u32>> {
+    for _ in 0..200 {
+      if let Ok(guard) = self.flows_tx.try_lock() {
+        return guard.as_ref().map(|flows| flows.channel_subscriber_counts());
+      }
+      std::thread::yield_now();
+    }
+    None
+  }
+}
+
 impl DeviceServer {
+  /// ONS fork (ONS #171): see [`SubscriptionsView`].
+  pub fn subscriptions_view(&self) -> SubscriptionsView {
+    SubscriptionsView {
+      rx: self.channels_subscriber.clone(),
+      rx_channels: self.self_info.rx_channels.len(),
+      flows_tx: self.flows_tx.clone(),
+    }
+  }
+
   /// Starts the device with the clock taken from `settings.clock_path` (usrvclock socket, Unix only).
   /// On platforms without that transport use [`DeviceServer::start_with_clock`].
   pub async fn start(settings: settings::Settings) -> Self {
