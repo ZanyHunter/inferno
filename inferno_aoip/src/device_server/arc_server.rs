@@ -83,7 +83,12 @@ pub async fn run_server(
             unknown7_1: 1,
             unknown8_0: [0; 6],
           };
-          conn.respond_with_struct(CODE_OK, response).await;
+          let mut response_bytes = response.binary_serialize_to_array(binary_serde::Endianness::Big).as_slice().to_vec();
+          // ONS fork, lab only: replace the capability word (`unknown1_0` + `flags2`).
+          if let Some(word) = self_info.capabilities.lab.arc_capability_word {
+            response_bytes[0..2].copy_from_slice(&word.to_be_bytes());
+          }
+          conn.respond_with_code(CODE_OK, &response_bytes).await;
         }
 
         GET_DEVICE_NAME_OPCODE => {

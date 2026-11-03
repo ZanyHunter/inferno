@@ -371,6 +371,7 @@ mod tests {
       latency_max_ns: 10_000_000,
       latency_default_ns: 10_000_000,
       board_flags: [0; 4],
+      lab: Default::default(),
     };
     let v = Values::from_device(&info);
     assert_eq!(v.sample_rate, 48_000);
