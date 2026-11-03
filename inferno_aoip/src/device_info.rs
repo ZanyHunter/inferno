@@ -30,6 +30,25 @@ pub struct DeviceCapabilities {
   /// Dante Controller reads to decide which controls to enable. The default advertises only the
   /// manufacturer-name bit (`0x10` in the third byte), as upstream Inferno did.
   pub board_flags: [u8; 4],
+  /// Lab-only overrides of replies, used to find what Dante Controller keys on. All off by default.
+  pub lab: LabOverrides,
+}
+
+/// Lab-only overrides (ONS fork, issue ONS #151). Every field is "off" by default, so a device built
+/// without them answers exactly as before. They exist so a hardware test can try a candidate reply
+/// without rebuilding; the host reads them from environment variables.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LabOverrides {
+  /// The two bytes after the result code in the ARC `0x1000` reply (channel and flow counts): the
+  /// capability word. Default (`None`) is `0x0030`; a Dante Virtual Soundcard sends `0x0ff9`.
+  pub arc_capability_word: Option<u16>,
+  /// Replacements applied to the conmon board-info reply (`07 2a 00 60`) just before it is sent:
+  /// `(offset from the start of the UDP payload, bytes)`. Offsets below `0x20` (the packet header)
+  /// and past the end of the reply are ignored.
+  pub board_record_patch: Vec<(usize, Vec<u8>)>,
+  /// Replaces the protocol version word (`0x072a`) in the first two opcode bytes of every conmon
+  /// multicast reply. A Dante Virtual Soundcard sends `0x0732`.
+  pub conmon_version: Option<u16>,
 }
 
 impl DeviceCapabilities {
@@ -40,6 +59,7 @@ impl DeviceCapabilities {
       latency_max_ns: latency_ns,
       latency_default_ns: latency_ns,
       board_flags: [0, 0, 0x10, 0],
+      lab: LabOverrides::default(),
     }
   }
 }

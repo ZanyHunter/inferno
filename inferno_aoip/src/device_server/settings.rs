@@ -24,7 +24,7 @@ use std::{
 use netdev::mac::MacAddr;
 
 use crate::common::warn;
-use crate::device_info::{Channel, DeviceCapabilities, DeviceId, DeviceInfo};
+use crate::device_info::{Channel, DeviceCapabilities, DeviceId, DeviceInfo, LabOverrides};
 
 use super::device_name::{DeviceNaming, DeviceRename, RenameCallback};
 use crate::media_clock::ClockStatusHandle;
@@ -333,6 +333,7 @@ pub struct SettingsBuilder {
   on_device_rename: Option<RenameCallback>,
   latency_range: Option<(usize, usize, usize)>,
   board_flags: Option<[u8; 4]>,
+  lab_overrides: Option<LabOverrides>,
   /// Upstream compatibility: names are not validated (only cut to 31 characters), the default name
   /// keeps its historic `<app> <hex ip>` form, and an IPv4 address that matches no adapter is accepted.
   legacy: bool,
@@ -370,6 +371,7 @@ impl SettingsBuilder {
       on_device_rename: None,
       latency_range: None,
       board_flags: None,
+      lab_overrides: None,
       legacy: false,
     }
   }
@@ -547,6 +549,12 @@ impl SettingsBuilder {
     self
   }
 
+  /// ONS fork: lab-only reply overrides (see [`LabOverrides`]). Default: none.
+  pub fn lab_overrides(mut self, lab: LabOverrides) -> Self {
+    self.lab_overrides = Some(lab);
+    self
+  }
+
   /// Build [`Settings`], looking up the adapter with the operating system if needed.
   pub fn build(self) -> Result<Settings, SettingsError> {
     // Only enumerate adapters when the host did not hand us the details.
@@ -652,6 +660,9 @@ impl SettingsBuilder {
       caps.latency_default_ns = latency_default_ns;
       if let Some(flags) = self.board_flags {
         caps.board_flags = flags;
+      }
+      if let Some(lab) = self.lab_overrides {
+        caps.lab = lab;
       }
       caps
     };
@@ -1240,6 +1251,15 @@ mod tests {
     let c = &s.self_info.capabilities;
     assert_eq!((c.latency_min_ns, c.latency_max_ns, c.latency_default_ns), (4_000_000, 10_000_000, 10_000_000));
     assert_eq!(c.board_flags, [1, 2, 3, 4]);
+    assert_eq!(c.lab, LabOverrides::default());
+
+    let lab = LabOverrides {
+      arc_capability_word: Some(0x0ff9),
+      board_record_patch: vec![(0x43, vec![1])],
+      conmon_version: Some(0x0732),
+    };
+    let s = build(base().lab_overrides(lab.clone())).unwrap();
+    assert_eq!(s.self_info.capabilities.lab, lab);
 
     for (min, max, def) in [(0, 10, 5), (10, 4, 5), (4, 10, 11), (4, 10, 3)] {
       assert!(

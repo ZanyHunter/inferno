@@ -109,6 +109,21 @@ fn capability_status_content(current: u32, supported: &[u32]) -> Vec<u8> {
   c
 }
 
+/// Apply lab replacements to a reply `content` (the bytes after the 32-byte header). Offsets in `patch`
+/// count from the start of the UDP payload; those inside the header or past the end are ignored, and a
+/// replacement that would run past the end is cut.
+fn apply_record_patch(content: &mut [u8], patch: &[(usize, Vec<u8>)]) {
+  const HEADER: usize = 32;
+  for (offset, bytes) in patch {
+    let Some(start) = offset.checked_sub(HEADER) else { continue };
+    if start >= content.len() {
+      continue;
+    }
+    let n = bytes.len().min(content.len() - start);
+    content[start..start + n].copy_from_slice(&bytes[..n]);
+  }
+}
+
 struct Multicaster<'s> {
   self_info: &'s DeviceInfo,
   pub server: UdpSocketWrapper,
@@ -170,7 +185,11 @@ impl<'s> Multicaster<'s> {
     return self.server.should_work();
   }
 
-  async fn send(&mut self, dst: SocketAddr, start_code: u16, opcode: [u8; 8], content: &[u8]) {
+  async fn send(&mut self, dst: SocketAddr, start_code: u16, mut opcode: [u8; 8], content: &[u8]) {
+    // ONS fork, lab only: report another protocol version word (`07 2a`) in every reply.
+    if let Some(version) = self.self_info.capabilities.lab.conmon_version {
+      opcode[0..2].copy_from_slice(&version.to_be_bytes());
+    }
     let pkt = make_packet(
       &mut self.send_buffer,
       start_code,
@@ -217,7 +236,23 @@ impl<'s> Multicaster<'s> {
     write_str_to_buffer(&mut content, 12, 8, &self.self_info.board_name);
     write_str_to_buffer(&mut content, 0x38, 16, &self.self_info.board_name);
 
+    apply_record_patch(&mut content, &self.self_info.capabilities.lab.board_record_patch);
+
     self.send(self.device_info_destination, 0xffff, [0x07, 0x2a, 0x00, 0x60, 0, 0, 0, 0], &content).await;
+  }
+
+  /// Reply to a lock status request (`07 xx 10 08`): opcode `07 2a 10 09`, ONS fork. A Dante Virtual
+  /// Soundcard answers with 16 zero bytes, which Dante Controller reads as "not locked". Dante Controller
+  /// asks for it when the Device Config tab opens and keeps asking while it gets no answer.
+  async fn send_lock_status(&mut self) {
+    self.send(self.device_info_destination, 0xffff, [0x07, 0x2a, 0x10, 0x09, 0, 0, 0, 0], &[0u8; 16]).await;
+  }
+
+  /// Reply to a sample rate pull-up status request (`07 xx 00 85`): opcode `07 2a 00 84`, ONS fork. ONS
+  /// has no pull-up: one value (0 = none), fixed.
+  async fn send_pullup_status(&mut self) {
+    let content = capability_status_content(0, &[0]);
+    self.send(self.device_info_destination, 0xffff, [0x07, 0x2a, 0x00, 0x84, 0, 0, 0, 0], &content).await;
   }
 
   /// Reply to a sample rate status request (`07 xx 00 81`): opcode `07 2a 00 80`.
@@ -504,6 +539,12 @@ pub async fn run_server(
           [0x07, _, 0, 0x83, 0, 0, 0, _] => {
             mcaster.send_encoding_status().await;
           },
+          [0x07, _, 0, 0x85, 0, 0, 0, _] => {
+            mcaster.send_pullup_status().await;
+          },
+          [0x07, _, 0x10, 0x08, 0, 0, 0, _] => {
+            mcaster.send_lock_status().await;
+          },
           [0x07, _ /* was 0x38 */, 0, 0x21, 0, 0, 0, _ /* was 0x64 */] => {
             mcaster.send_clock_stats().await;
           },
@@ -728,6 +769,51 @@ mod tests {
     info.capabilities.board_flags = [0x01, 0x50, 0x10, 0x00];
     let pkt = capture(&info, |m| Box::pin(m.send_board_info())).await;
     assert_eq!(&pkt[32 + 0x14..32 + 0x18], &[0x01, 0x50, 0x10, 0x00]);
+  }
+
+  /// What a Dante Virtual Soundcard sent in answer to the Device Config tab of Dante Controller (Mac,
+  /// 2026-11-01): 16 zero bytes after the opcode.
+  #[tokio::test]
+  async fn lock_status_says_not_locked_like_a_dvs() {
+    let pkt = capture(&test_info(), |m| Box::pin(m.send_lock_status())).await;
+    assert_eq!(&pkt[24..32], &[0x07, 0x2a, 0x10, 0x09, 0, 0, 0, 0]);
+    assert_eq!(&pkt[32..], &[0u8; 16]);
+    assert_eq!(pkt.len(), 48);
+  }
+
+  #[tokio::test]
+  async fn pullup_status_reports_a_single_fixed_value() {
+    let pkt = capture(&test_info(), |m| Box::pin(m.send_pullup_status())).await;
+    assert_eq!(&pkt[24..32], &[0x07, 0x2a, 0x00, 0x84, 0, 0, 0, 0]);
+    assert_eq!(&pkt[32..], &[0x00, 0x18, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+  }
+
+  #[tokio::test]
+  async fn lab_overrides_patch_the_board_record_and_the_version_word() {
+    let mut info = test_info();
+    info.capabilities.lab.conmon_version = Some(0x0732);
+    info.capabilities.lab.board_record_patch = vec![
+      (0x20, vec![4, 2, 0, 3]),   // software version
+      (0x43, vec![1]),            // fourth component
+      (0x10, vec![0xee]),         // inside the header: ignored
+      (10_000, vec![0xee]),       // past the end: ignored
+    ];
+    let pkt = capture(&info, |m| Box::pin(m.send_board_info())).await;
+    assert_eq!(&pkt[24..28], &[0x07, 0x32, 0x00, 0x60]);
+    assert_eq!(&pkt[0x20..0x24], &[4, 2, 0, 3]);
+    assert_eq!(pkt[0x43], 1);
+    assert_eq!(&pkt[8..16], &[1, 2, 3, 4, 5, 6, 7, 8], "the header is untouched");
+    // Without overrides the record keeps the upstream bytes.
+    let plain = capture(&test_info(), |m| Box::pin(m.send_board_info())).await;
+    assert_eq!(&plain[24..28], &[0x07, 0x2a, 0x00, 0x60]);
+    assert_eq!(&plain[0x20..0x24], &[4, 1, 0, 6]);
+  }
+
+  #[test]
+  fn record_patch_is_clipped_to_the_record() {
+    let mut c = [0u8; 4];
+    apply_record_patch(&mut c, &[(0x20 + 2, vec![9, 9, 9]), (0x1f, vec![7]), (0x20 + 4, vec![5])]);
+    assert_eq!(c, [0, 0, 9, 9]);
   }
 
   #[tokio::test]
