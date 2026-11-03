@@ -53,6 +53,74 @@ pub const MAX_IDLE_SLEEP: Duration = Duration::from_millis(250);
 /// the leader can be reported a moment before our media clock is on its timeline.
 pub const LEADER_SETTLE: Duration = Duration::from_millis(150);
 
+/// ONS fork (ZanyHunter/open-network-soundcard#145): a pass of the transmit loop that waits or works longer
+/// than this is reported by [`stall_report`], so a packet gap seen on the wire can be traced to its cause.
+pub const STALL_REPORT_THRESHOLD: Duration = Duration::from_millis(3);
+
+/// ONS fork: at most one stall report per this interval (the rest are counted), so a thread that stalls
+/// on every pass cannot flood the log.
+const STALL_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// ONS fork: where one slow pass of the transmit loop spent its time. Built by [`stall_report`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StallReport {
+  /// The wait that was asked for.
+  pub requested: Duration,
+  /// How much longer than asked the wait took: the thread was not running (descheduled, or the timer
+  /// fired late). Not our code.
+  pub woke_late: Duration,
+  /// The whole transmit pass (clock read, packet building, `send` calls).
+  pub transmit: Duration,
+  /// The slowest single `send` in that pass: a send that blocks (NIC driver, packet capture filter).
+  pub longest_send: Duration,
+}
+
+/// ONS fork: `Some` when a pass of the loop was slow enough to be reported: the wait overshot by
+/// `threshold` or more, or the transmit pass took that long.
+pub fn stall_report(
+  requested: Duration,
+  slept: Duration,
+  transmit: Duration,
+  longest_send: Duration,
+  threshold: Duration,
+) -> Option<StallReport> {
+  let woke_late = slept.saturating_sub(requested);
+  if woke_late >= threshold || transmit >= threshold {
+    Some(StallReport { requested, woke_late, transmit, longest_send })
+  } else {
+    None
+  }
+}
+
+impl StallReport {
+  /// Names the part that is to blame, from the numbers.
+  pub fn cause(&self, threshold: Duration) -> &'static str {
+    if self.longest_send >= threshold {
+      "a send() call blocked (NIC driver or capture filter)"
+    } else if self.woke_late >= threshold && self.transmit < threshold {
+      "the thread was not scheduled (sleep overshoot): OS or hardware, not the transmit code"
+    } else if self.transmit >= threshold && self.woke_late < threshold {
+      "the transmit pass itself was slow (descheduled while running, or the clock/ring reads)"
+    } else {
+      "the thread was not scheduled and the transmit pass was slow too"
+    }
+  }
+}
+
+impl std::fmt::Display for StallReport {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "tx thread stall: waited {:.2} ms for a {:.2} ms sleep, transmit pass {:.2} ms (longest send {:.2} ms): {}",
+      (self.requested + self.woke_late).as_secs_f64() * 1e3,
+      self.requested.as_secs_f64() * 1e3,
+      self.transmit.as_secs_f64() * 1e3,
+      self.longest_send.as_secs_f64() * 1e3,
+      self.cause(STALL_REPORT_THRESHOLD)
+    )
+  }
+}
+
 // it's better to have the clock in the past than in the future - otherwise Dante devices receiving from us go mad and fart
 const CLOCK_OFFSET_NS: ClockDiff = -500_000;
 
@@ -129,6 +197,11 @@ struct FlowsTransmitterInternal<P: ProxyToSamplesBuffer> {
   /// Since when the gate has seen a leader without a break.
   leader_since: Option<Instant>,
   leader_settle: Duration,
+  /// ONS fork (#145): the slowest `send` of the current transmit pass.
+  longest_send: Duration,
+  /// ONS fork (#145): when the last stall was logged, and how many were left out since.
+  last_stall_log: Option<Instant>,
+  stalls_unlogged: u32,
 }
 
 impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
@@ -200,6 +273,27 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
     true
   }
 
+  /// ONS fork (#145): log a loop pass that waited or worked for [`STALL_REPORT_THRESHOLD`] or more, with
+  /// the part that was slow, at most once per [`STALL_REPORT_INTERVAL`].
+  fn log_stall(&mut self, requested: Duration, slept: Duration, transmit: Duration) {
+    let Some(report) =
+      stall_report(requested, slept, transmit, self.longest_send, STALL_REPORT_THRESHOLD)
+    else {
+      return;
+    };
+    if self.last_stall_log.is_some_and(|t| t.elapsed() < STALL_REPORT_INTERVAL) {
+      self.stalls_unlogged += 1;
+      return;
+    }
+    let more = std::mem::take(&mut self.stalls_unlogged);
+    if more > 0 {
+      warn!("{report} (and {more} more since the last report)");
+    } else {
+      warn!("{report}");
+    }
+    self.last_stall_log = Some(Instant::now());
+  }
+
   #[inline(always)]
   fn transmit(&mut self, dither_rng: &mut SmallRng, now: LongClock, process_events: bool) {
     let mut tmp_samples = [0 as Sample; FPP_MAX as usize];
@@ -209,6 +303,7 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
     let max_lag_samples = self.max_lag_samples;
     let mut iterations = 0;
     let mut max_missing_samples = 0;
+    self.longest_send = Duration::ZERO;
     if !self.gate_allows(now) {
       return;
     }
@@ -288,7 +383,10 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
           }
         }
         let to_send = 9 + stride * flow.fpp;
-        if let Ok(written) = flow.socket.send(&pbuff[0..to_send]) {
+        let send_started = Instant::now();
+        let sent = flow.socket.send(&pbuff[0..to_send]);
+        self.longest_send = self.longest_send.max(send_started.elapsed());
+        if let Ok(written) = sent {
           if written == to_send {
             flow.next_ts = flow.next_ts.wrapping_add(flow.fpp.try_into().unwrap());
           } else {
@@ -409,9 +507,12 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
           .store(cur_ts_opt.unwrap_or(usize::MAX), Ordering::SeqCst /*TODO: really needed?*/);
         self.on_transfer.as_ref().map(|transfer| (transfer.callback)());
 
+        let sleep_started = Instant::now();
         if !sleep_duration.is_zero() {
           std::thread::sleep(sleep_duration);
         }
+        let woke_at = Instant::now();
+        let slept = woke_at.duration_since(sleep_started);
         if let Some(now) = self.now() {
           // ONS fork: the media clock can step backwards (a PTP lock); a deadline set before the step
           // would then be far in the future and keep the keepalive checks from ever running.
@@ -420,6 +521,7 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
           }
           let process_events = wrapped_diff(now as Clock, next_process_events) >= 0;
           self.transmit(&mut dither_rng, now, process_events);
+          self.log_stall(sleep_duration, slept, woke_at.elapsed());
           if process_events {
             next_process_events = (now as Clock).wrapping_add(process_events_interval);
           }
@@ -618,6 +720,9 @@ impl FlowsTransmitter {
       leader_gate,
       leader_since: None,
       leader_settle: LEADER_SETTLE,
+      longest_send: Duration::ZERO,
+      last_stall_log: None,
+      stalls_unlogged: 0,
     };
     internal.run(start_time_rx).await;
   }
@@ -960,6 +1065,9 @@ mod tests {
       leader_gate: gate,
       leader_since: None,
       leader_settle: Duration::from_millis(40),
+      longest_send: Duration::ZERO,
+      last_stall_log: None,
+      stalls_unlogged: 0,
     }
   }
 
@@ -1128,5 +1236,158 @@ mod tests {
       assert!(seconds.len() > 10, "flow {i}: {} packets after the step", seconds.len());
       assert!(seconds.iter().all(|&s| s < before), "flow {i}: {seconds:?}");
     }
+  }
+
+  const MS: Duration = Duration::from_millis(1);
+  const US: Duration = Duration::from_micros(1);
+
+  #[test]
+  fn a_pass_that_waits_and_works_normally_is_not_a_stall() {
+    // Woke 0.6 ms late, 0.2 ms of work: the usual picture on Windows with a precise timer.
+    let r = stall_report(1250 * US, 1850 * US, 200 * US, 40 * US, STALL_REPORT_THRESHOLD);
+    assert_eq!(r, None);
+  }
+
+  #[test]
+  fn a_late_wake_is_blamed_on_the_scheduler_not_on_the_transmit_code() {
+    let r = stall_report(MS, 13 * MS, 200 * US, 40 * US, STALL_REPORT_THRESHOLD).unwrap();
+    assert_eq!(r.woke_late, 12 * MS);
+    assert!(
+      r.cause(STALL_REPORT_THRESHOLD).contains("not scheduled"),
+      "{}",
+      r.cause(STALL_REPORT_THRESHOLD)
+    );
+  }
+
+  #[test]
+  fn a_blocked_send_is_blamed_on_the_send() {
+    let r = stall_report(MS, MS, 9 * MS, 8 * MS, STALL_REPORT_THRESHOLD).unwrap();
+    assert!(r.cause(STALL_REPORT_THRESHOLD).contains("send() call blocked"));
+  }
+
+  #[test]
+  fn slow_work_without_a_slow_send_is_blamed_on_the_transmit_pass() {
+    let r = stall_report(MS, MS, 5 * MS, 100 * US, STALL_REPORT_THRESHOLD).unwrap();
+    assert!(r.cause(STALL_REPORT_THRESHOLD).contains("transmit pass itself"));
+  }
+
+  #[test]
+  fn a_wait_that_ends_early_is_never_a_stall() {
+    assert_eq!(stall_report(5 * MS, 2 * MS, 100 * US, Duration::ZERO, STALL_REPORT_THRESHOLD), None);
+  }
+
+  #[test]
+  fn the_report_names_the_numbers() {
+    let r = stall_report(MS, 13 * MS, 200 * US, 40 * US, STALL_REPORT_THRESHOLD).unwrap();
+    let text = r.to_string();
+    assert!(text.contains("waited 13.00 ms for a 1.00 ms sleep"), "{text}");
+    assert!(text.contains("transmit pass 0.20 ms"), "{text}");
+  }
+
+  #[test]
+  fn stall_logging_is_rate_limited_and_counts_what_it_left_out() {
+    let mut t = internal(None);
+    // The first stall is logged; the next ones inside the interval are only counted.
+    t.log_stall(MS, 13 * MS, 200 * US);
+    assert!(t.last_stall_log.is_some());
+    assert_eq!(t.stalls_unlogged, 0);
+    t.log_stall(MS, 13 * MS, 200 * US);
+    t.log_stall(MS, 14 * MS, 200 * US);
+    assert_eq!(t.stalls_unlogged, 2);
+    // A normal pass changes nothing.
+    t.log_stall(MS, 2 * MS, 100 * US);
+    assert_eq!(t.stalls_unlogged, 2);
+    // After the interval the next stall is logged and the count restarts.
+    t.last_stall_log = Some(Instant::now() - STALL_REPORT_INTERVAL - MS);
+    t.log_stall(MS, 13 * MS, 200 * US);
+    assert_eq!(t.stalls_unlogged, 0);
+  }
+
+  #[test]
+  fn the_longest_send_is_reset_at_the_start_of_each_pass() {
+    let mut t = internal(None);
+    let _rx = add_flow(&mut t, 0, false);
+    let mut rng = SmallRng::seed_from_u64(1);
+    t.longest_send = Duration::from_secs(5);
+    let now = t.now().unwrap();
+    t.transmit(&mut rng, now, false);
+    // A loopback send takes far less than the seeded 5 s.
+    assert!(t.longest_send < Duration::from_secs(1));
+  }
+
+  /// Collects the `flows_tx` log lines of [`the_real_loop_under_load_reports_its_stalls`].
+  struct Capture(std::sync::Mutex<Vec<(Instant, String)>>);
+
+  impl log::Log for Capture {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+      m.target().contains("flows_tx")
+    }
+    fn log(&self, r: &log::Record) {
+      if self.enabled(r.metadata()) {
+        self.0.lock().unwrap().push((Instant::now(), format!("{}", r.args())));
+      }
+    }
+    fn flush(&self) {}
+  }
+
+  /// Manual measurement for ZanyHunter/open-network-soundcard#145, not part of the normal run:
+  /// `cargo test -p inferno_aoip --release -- --ignored --nocapture the_real_loop`. Runs the real transmit
+  /// loop (own thread, MMCSS, the same sleeps) with 4 flows of 60 frames per packet on 127.0.0.1 for
+  /// `TX_STALL_SECONDS` (default 20) seconds, optionally next to `TX_STALL_LOAD` busy threads, and prints
+  /// every stall the loop reported with its cause. Binds loopback only.
+  #[test]
+  #[ignore]
+  fn the_real_loop_under_load_reports_its_stalls() {
+    static CAPTURE: Capture = Capture(std::sync::Mutex::new(Vec::new()));
+    log::set_logger(&CAPTURE).unwrap();
+    log::set_max_level(log::LevelFilter::Info);
+    let env =
+      |name: &str, default: u64| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+    let started = Instant::now();
+    let seconds = env("TX_STALL_SECONDS", 20);
+    let load = env("TX_STALL_LOAD", 0);
+    let end = Instant::now() + Duration::from_secs(seconds);
+    for _ in 0..load {
+      std::thread::spawn(move || {
+        while Instant::now() < end {
+          std::hint::black_box((0..1000u64).fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(b)));
+        }
+      });
+    }
+    let (received_tx, received_rx) = std::sync::mpsc::channel::<u64>();
+    let thread = run_future_in_new_thread("tx stall hunt", move || {
+      async move {
+        let mut t = internal(None);
+        // A live command queue: a closed one means shutdown.
+        let (_commands, queue) = mpsc::channel(8);
+        t.commands_receiver = queue;
+        let receivers: Vec<_> = (0..4).map(|i| add_flow(&mut t, i, false)).collect();
+        for flow in t.flows.iter_mut().flatten() {
+          flow.fpp = 60;
+        }
+        let stop = t.stop.clone();
+        std::thread::spawn(move || {
+          std::thread::sleep(Duration::from_secs(seconds));
+          stop.store(true, Ordering::Release);
+        });
+        t.run(None).await;
+        let mut buf = [0u8; 2048];
+        let mut packets = 0u64;
+        for rx in &receivers {
+          while rx.recv(&mut buf).is_ok() {
+            packets += 1;
+          }
+        }
+        received_tx.send(packets).unwrap();
+      }
+      .boxed_local()
+    });
+    thread.join().unwrap();
+    let stalls = CAPTURE.0.lock().unwrap();
+    println!("{} stall reports in {seconds} s with {load} busy threads:", stalls.len());
+    for (at, line) in stalls.iter() {
+      println!("  +{:.1} s {line}", at.duration_since(started).as_secs_f64());
+    }
+    println!("(packets still queued at the receivers at the end: {})", received_rx.recv().unwrap());
   }
 }

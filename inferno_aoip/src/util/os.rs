@@ -68,10 +68,14 @@ pub fn enter_realtime() -> RealtimeGrant {
 pub fn set_current_thread_realtime(_priority_hint: u8) -> Result<(), Error> {
   // ONS fork: MMCSS "Pro Audio" (or a high thread priority without it) instead of upstream's Unix SCHED_FIFO.
   let grant = enter_realtime();
+  // Info, not debug: whether the TX/RX threads got MMCSS is the first thing to check when a soak shows
+  // packet gaps (ZanyHunter/open-network-soundcard#145).
+  let thread = std::thread::current();
+  let name = thread.name().unwrap_or("unnamed");
   if grant.mmcss {
-    log::debug!("realtime thread: MMCSS Pro Audio");
+    log::info!("realtime thread {name:?}: MMCSS Pro Audio");
   } else {
-    log::warn!("realtime thread: no MMCSS, thread priority {:?}", grant.thread_priority);
+    log::warn!("realtime thread {name:?}: no MMCSS, thread priority {:?}", grant.thread_priority);
   }
   Ok(())
 }
