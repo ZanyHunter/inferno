@@ -583,6 +583,98 @@ mod tests {
     assert!(result.is_err(), "started on an address that does not exist");
   }
 
+  /// ONS fork (ZanyHunter/open-network-soundcard#15, control-plane.md section 7 finding 2): Dante
+  /// Controller asks `<device>._netaudio-cmc._udp.local` for its SRV record and the lab capture of an old build
+  /// shows no answer. The CMC record must exist, be found under that name, and carry the CMC port.
+  #[test]
+  fn the_cmc_service_record_is_built_under_the_instance_name_with_the_cmc_port() {
+    use searchfire::dns::rr::{RData, RecordType};
+    let info = info_with_channels(1);
+    let service = cmc_service(&info, "ONS-TEST").unwrap();
+    // a question for the instance name (what a controller asks) matches the record, whatever the case
+    let asked = Name::from_ascii("ons-test._netaudio-cmc._udp.local.").unwrap();
+    assert_eq!(service.service_id(), &asked);
+    assert_eq!(service.service_type(), &service_type("_netaudio-cmc"));
+    assert_eq!(service.port(), info.cmc_port);
+
+    let response = service.dns_response().unwrap();
+    let srv = response
+      .answers()
+      .iter()
+      .find(|r| r.record_type() == RecordType::SRV)
+      .expect("no SRV record in the CMC answer");
+    assert_eq!(srv.name(), &asked);
+    match srv.data() {
+      Some(RData::SRV(srv)) => assert_eq!(srv.port(), 8800),
+      other => panic!("SRV record without SRV data: {other:?}"),
+    }
+    assert!(response.answers().iter().any(|r| r.record_type() == RecordType::PTR));
+    assert!(response.answers().iter().any(|r| r.record_type() == RecordType::TXT));
+    assert!(response.additionals().iter().any(|r| r.record_type() == RecordType::A));
+    // and it must encode, because the responder silently skips a record that does not
+    use searchfire::dns::serialize::binary::BinEncodable;
+    assert!(response.to_bytes().is_ok());
+  }
+
+  /// The same question over the wire (a QU question, so the answer comes back unicast to the asker). Skipped
+  /// where the host cannot do mDNS on loopback.
+  #[test]
+  fn the_cmc_srv_question_is_answered_over_the_wire() {
+    use searchfire::dns::op::{Message, MessageType, OpCode, Query};
+    use searchfire::dns::rr::RecordType;
+    use searchfire::dns::serialize::binary::{BinDecodable, BinEncodable};
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+
+    let mut info = info_with_channels(1);
+    info.ip_address = Ipv4Addr::LOCALHOST;
+    let info = Arc::new(info);
+    let responder = match DeviceMDNSResponder::start(info.clone(), Default::default()) {
+      Ok(r) => r,
+      Err(e) => {
+        eprintln!("skipped, no mDNS on loopback here: {e}");
+        return;
+      }
+    };
+    let hostname = info.friendly_hostname();
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+    sock.bind(&SockAddr::from(std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
+    sock.set_multicast_if_v4(&Ipv4Addr::LOCALHOST).unwrap();
+    sock.set_multicast_loop_v4(true).unwrap();
+    let sock: std::net::UdpSocket = sock.into();
+    sock.set_read_timeout(Some(std::time::Duration::from_millis(500))).unwrap();
+
+    let ask = |name: &str, rtype: RecordType| -> Option<Message> {
+      let mut query = Query::query(Name::from_ascii(name).unwrap(), rtype);
+      query.set_mdns_unicast_response(true);
+      let mut message = Message::new();
+      message.set_message_type(MessageType::Query).set_op_code(OpCode::Query).add_query(query);
+      let bytes = message.to_bytes().unwrap();
+      let mut buf = [0u8; 2048];
+      for _ in 0..6 {
+        sock.send_to(&bytes, (Ipv4Addr::new(224, 0, 0, 251), 5353)).ok()?;
+        if let Ok((n, _)) = sock.recv_from(&mut buf) {
+          return Message::from_bytes(&buf[..n]).ok();
+        }
+      }
+      None
+    };
+
+    // Control: the ARC record is found, so a missing CMC answer is not a host that cannot do mDNS.
+    let arc_name = format!("{hostname}._netaudio-arc._udp.local.");
+    if ask(&arc_name, RecordType::SRV).is_none() {
+      eprintln!("skipped, the responder does not answer on loopback here");
+      responder.shutdown_and_join();
+      return;
+    }
+    let cmc_name = format!("{hostname}._netaudio-cmc._udp.local.");
+    let answer = ask(&cmc_name, RecordType::SRV).expect("no answer to the _netaudio-cmc SRV question");
+    eprintln!("cmc SRV question answered with {} records", answer.answers().len());
+    assert!(answer.answers().iter().any(|r| r.record_type() == RecordType::SRV), "{answer:?}");
+    let ptr = ask("_netaudio-cmc._udp.local.", RecordType::PTR).expect("no answer to the _netaudio-cmc PTR question");
+    assert!(ptr.answers().iter().any(|r| r.record_type() == RecordType::PTR), "{ptr:?}");
+    responder.shutdown_and_join();
+  }
+
   /// A responder over the loopback interface (skipped where the host cannot do mDNS on loopback).
   /// The requests a controller can make about names and channels that do not exist or are not valid
   /// must not panic, and shutting down twice is harmless.

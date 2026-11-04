@@ -7,7 +7,7 @@ opcode2 = 0315 = too many tx flows
 opcode2 = 0301 = sample rate mismatch
 */
 
-use log::{error, warn};
+use log::{debug, warn};
 use std::{
   error::Error,
   io::ErrorKind,
@@ -40,6 +40,21 @@ pub enum FlowControlError {
   TooManyTXFlows = 0x0315,
   #[error("sample rate mismatch")]
   SampleRateMismatch = 0x0301,
+}
+
+/// The transmitter answered a request with a result code other than OK.
+#[derive(Error, Debug)]
+#[error("transmitter returned error code {code:#06x}: {packet_hex}")]
+pub struct RemoteError {
+  pub code: u16,
+  packet_hex: String,
+}
+
+impl RemoteError {
+  /// True if the transmitter says the flow does not exist (any more): it expired the flow, or never had it.
+  pub fn is_flow_not_found(&self) -> bool {
+    self.code == FlowControlError::FlowNotFound as u16
+  }
 }
 
 pub struct FlowsControlClient {
@@ -95,8 +110,9 @@ impl FlowsControlClient {
             return Ok(req_resp_packet::View::new(&recvbuf[..recv_size]));
             // creating another View is necessary because https://users.rust-lang.org/t/solved-borrow-doesnt-drop-returning-this-value-requires-that/24182
           } else {
-            error!("server returned error: {}", hex::encode(&resp.into_storage()));
-            return Err(Box::new(std::io::Error::from(ErrorKind::InvalidData)));
+            // (not logged here: what an error means depends on the request, the caller decides)
+            let code = resp.opcode2().read();
+            return Err(Box::new(RemoteError { code, packet_hex: hex::encode(&resp.into_storage()) }));
           }
         } else {
           warn!("received spurious packet: {}", hex::encode(&resp.into_storage()));
@@ -189,10 +205,18 @@ impl FlowsControlClient {
     let mut body = ByteBuffer::new();
     body.write_bytes(&handle);
     let mut recvbuf = [0; MTU];
-    return self
-      .send_and_wait_for_reply(&mut recvbuf, &socket, dbcp1, 0x0101, body.as_bytes())
-      .await
-      .map(|_| ());
+    // One request, never repeated. ONS fork (ZanyHunter/open-network-soundcard#15, control-plane.md section 7
+    // finding 3): a lab capture showed 358 of 358 stops answered "flow not found". That answer means the
+    // transmitter has already dropped the flow (it expires flows that get no keepalives), which is what the
+    // stop wanted, so it is a success and nothing is sent again.
+    match self.send_and_wait_for_reply(&mut recvbuf, &socket, dbcp1, 0x0101, body.as_bytes()).await {
+      Ok(_) => Ok(()),
+      Err(e) if e.downcast_ref::<RemoteError>().is_some_and(RemoteError::is_flow_not_found) => {
+        debug!("flow {handle:?} at {rem_addr} is already gone (transmitter answered 'flow not found')");
+        Ok(())
+      }
+      Err(e) => Err(e),
+    }
   }
 }
 
@@ -230,6 +254,59 @@ mod tests {
       flows_control_port: 0,
       info_request_port: 0,
     }
+  }
+
+  /// A transmitter on loopback that answers every request with `code` and counts the requests it gets.
+  async fn fake_transmitter(code: u16) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = requests.clone();
+    tokio::spawn(async move {
+      let mut buf = [0u8; MTU];
+      let mut out = [0u8; MTU];
+      loop {
+        let Ok((n, from)) = socket.recv_from(&mut buf).await else { return };
+        counter.fetch_add(1, Ordering::SeqCst);
+        let req = req_resp_packet::View::new(&buf[..n]);
+        let reply = make_packet(&mut out, 0x1102, req.seqnum().read(), req.opcode1().read(), code, &[]);
+        let _ = socket.send_to(reply, from).await;
+      }
+    });
+    (addr, requests)
+  }
+
+  #[tokio::test]
+  async fn a_stop_answered_flow_not_found_is_a_success_and_is_sent_once() {
+    let (addr, requests) = fake_transmitter(FlowControlError::FlowNotFound as u16).await;
+    let client = FlowsControlClient::new(Arc::new(minimal_device_info()));
+    client.stop_flow(&addr, 0x1102, [1, 2, 3, 4, 5, 6]).await.expect("flow not found counts as stopped");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(requests.load(Ordering::SeqCst), 1, "the stop must not be repeated");
+  }
+
+  #[tokio::test]
+  async fn a_stop_answered_ok_is_a_success_and_other_errors_still_fail() {
+    let (addr, requests) = fake_transmitter(1).await;
+    let client = FlowsControlClient::new(Arc::new(minimal_device_info()));
+    client.stop_flow(&addr, 0x1102, [0; 6]).await.unwrap();
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+    let (addr, requests) = fake_transmitter(FlowControlError::TooManyTXFlows as u16).await;
+    let err = client.stop_flow(&addr, 0x1102, [0; 6]).await.unwrap_err();
+    let remote = err.downcast_ref::<RemoteError>().expect("a remote error");
+    assert_eq!(remote.code, 0x0315);
+    assert!(!remote.is_flow_not_found());
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+  }
+
+  #[tokio::test]
+  async fn a_flow_request_answered_flow_not_found_is_still_an_error() {
+    // only the stop treats "flow not found" as done; an update of a flow the transmitter dropped must fail
+    let (addr, _requests) = fake_transmitter(FlowControlError::FlowNotFound as u16).await;
+    let client = FlowsControlClient::new(Arc::new(minimal_device_info()));
+    let err = client.update_flow(&addr, 0x1102, [0; 6], &[Some(1)]).await.unwrap_err();
+    assert!(err.downcast_ref::<RemoteError>().unwrap().is_flow_not_found());
   }
 
   #[test]
