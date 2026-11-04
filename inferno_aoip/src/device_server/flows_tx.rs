@@ -121,6 +121,99 @@ impl std::fmt::Display for StallReport {
   }
 }
 
+/// ONS fork (ZanyHunter/open-network-soundcard#178): the first wait after a failed `send`. It doubles on every
+/// further failure up to [`SEND_BACKOFF_MAX`], and is forgotten on the first success.
+pub const SEND_BACKOFF_MIN: Duration = Duration::from_millis(1);
+/// ONS fork (#178): the longest wait between retries of a flow whose `send` keeps failing.
+pub const SEND_BACKOFF_MAX: Duration = Duration::from_millis(100);
+/// ONS fork (#178): at most one log line per this interval about failing sends (the rest are counted).
+const SEND_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
+/// ONS fork (#178): what a flow does after a failed `send` (the NIC went away, the route is gone).
+///
+/// Upstream retried the same packet in a tight loop, which burned a core: 180,000 failures in 1.6 s on a
+/// NIC unplug, and MMCSS throttles a thread that does that, so the next 2 ms sleep took 15 ms. Now the flow
+/// stops trying for a while: 1 ms after the first failure, doubling per failure up to 100 ms, and back to
+/// normal on the first send that works. Packets are not queued up meanwhile: the flow's timestamp does not
+/// advance, and the usual lag handling of the transmit loop re-seeds it if the outage was long.
+///
+/// Time is passed in, so the logic can be tested without sleeping.
+#[derive(Debug, Default)]
+pub struct SendBackoff {
+  /// The current wait; zero while sends work.
+  delay: Duration,
+  retry_at: Option<Instant>,
+  /// Failures since the last success.
+  consecutive: u64,
+  /// Failures since the flow was created.
+  total: u64,
+  last_log: Option<Instant>,
+  unlogged: u64,
+}
+
+impl SendBackoff {
+  /// Whether the flow must not send at `now`.
+  pub fn blocked_at(&self, now: Instant) -> bool {
+    self.retry_at.is_some_and(|t| now < t)
+  }
+
+  /// [`Self::blocked_at`] for the real clock; reads it only while a failure is being backed off from.
+  pub fn blocked(&self) -> bool {
+    self.retry_at.is_some() && self.blocked_at(Instant::now())
+  }
+
+  /// How long until the flow may send again (zero if it may now).
+  pub fn remaining_at(&self, now: Instant) -> Duration {
+    self.retry_at.map_or(Duration::ZERO, |t| t.saturating_duration_since(now))
+  }
+
+  /// The current wait between retries (zero while sends work).
+  pub fn delay(&self) -> Duration {
+    self.delay
+  }
+
+  /// Failed sends since the last success.
+  pub fn consecutive_failures(&self) -> u64 {
+    self.consecutive
+  }
+
+  /// Failed sends since the flow was created.
+  pub fn total_failures(&self) -> u64 {
+    self.total
+  }
+
+  /// A send failed at `now`: wait longer before the next try. Returns `Some(n)` when it is time to log
+  /// (the first failure, then once per [`SEND_ERROR_LOG_INTERVAL`]), with `n` the failures that were left
+  /// out of the log since the last line.
+  pub fn failure(&mut self, now: Instant) -> Option<u64> {
+    self.delay =
+      if self.delay.is_zero() { SEND_BACKOFF_MIN } else { (self.delay * 2).min(SEND_BACKOFF_MAX) };
+    self.retry_at = Some(now + self.delay);
+    self.consecutive += 1;
+    self.total += 1;
+    if self.last_log.is_some_and(|t| now.saturating_duration_since(t) < SEND_ERROR_LOG_INTERVAL) {
+      self.unlogged += 1;
+      None
+    } else {
+      self.last_log = Some(now);
+      Some(std::mem::take(&mut self.unlogged))
+    }
+  }
+
+  /// A send worked. Returns the number of failures it ends, if there were any.
+  pub fn success(&mut self) -> Option<u64> {
+    if self.consecutive == 0 {
+      return None;
+    }
+    let failed = std::mem::take(&mut self.consecutive);
+    self.delay = Duration::ZERO;
+    self.retry_at = None;
+    self.last_log = None;
+    self.unlogged = 0;
+    Some(failed)
+  }
+}
+
 // it's better to have the clock in the past than in the future - otherwise Dante devices receiving from us go mad and fart
 const CLOCK_OFFSET_NS: ClockDiff = -500_000;
 
@@ -134,6 +227,8 @@ struct Flow {
   bytes_per_sample: usize,
   expires: Option<Clock>,
   expired: Arc<AtomicBool>,
+  /// ONS fork (#178): holds the flow back after failed sends.
+  send_backoff: SendBackoff,
 }
 
 impl Flow {
@@ -273,6 +368,17 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
     true
   }
 
+  /// ONS fork (#178): the time until the first flow that is in send backoff may try again, if any.
+  fn next_backoff_end(&self, now: Instant) -> Option<Duration> {
+    self
+      .flows
+      .iter()
+      .filter_map(|opt| opt.as_ref())
+      .filter(|flow| !flow.expired.load(Ordering::Relaxed) && flow.send_backoff.blocked_at(now))
+      .map(|flow| flow.send_backoff.remaining_at(now))
+      .min()
+  }
+
   /// ONS fork (#145): log a loop pass that waited or worked for [`STALL_REPORT_THRESHOLD`] or more, with
   /// the part that was slow, at most once per [`STALL_REPORT_INTERVAL`].
   fn log_stall(&mut self, requested: Duration, slept: Duration, transmit: Duration) {
@@ -331,7 +437,9 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
         flow.keep_alive(now as Clock, sample_rate);
       }
       pbuff[9..9 + stride * flow.fpp].fill(0);
-      while wrapped_diff(now as Clock, flow.next_ts as Clock) >= 0 {
+      // ONS fork (#178): a flow whose last send failed waits for its backoff to pass (the check also keeps
+      // the loop from retrying the same packet at full speed).
+      while !flow.send_backoff.blocked() && wrapped_diff(now as Clock, flow.next_ts as Clock) >= 0 {
         pbuff[0] = 2u8; // ???
         let packet_ts = flow.next_ts.wrapping_add_signed(self.clock_offset_samples) /* .wrapping_sub(flow.fpp) */; // ???
         let seconds = packet_ts / (sample_rate as LongClock);
@@ -386,15 +494,32 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
         let send_started = Instant::now();
         let sent = flow.socket.send(&pbuff[0..to_send]);
         self.longest_send = self.longest_send.max(send_started.elapsed());
-        if let Ok(written) = sent {
-          if written == to_send {
-            flow.next_ts = flow.next_ts.wrapping_add(flow.fpp.try_into().unwrap());
-          } else {
-            warn!("written {written}, should have {to_send}");
+        let failure = match sent {
+          Ok(written) if written == to_send => None,
+          Ok(written) => Some(format!("written {written}, should have {to_send}")),
+          Err(e) => Some(format!("send returned error: {e}")),
+        };
+        if let Some(what) = failure {
+          // ONS fork (#178): do not retry the packet at once; the flow waits (1 ms, doubling to 100 ms) and
+          // the errors are counted. The log is limited to one line a second.
+          if let Some(unlogged) = flow.send_backoff.failure(Instant::now()) {
+            let more = if unlogged > 0 {
+              format!(" (and {unlogged} more since the last line)")
+            } else {
+              String::new()
+            };
+            warn!(
+              "{what}; {} in a row, retrying in {:?}{more}",
+              flow.send_backoff.consecutive_failures(),
+              flow.send_backoff.delay()
+            );
           }
-        } else {
-          warn!("send returned error");
+          break;
         }
+        if let Some(failed) = flow.send_backoff.success() {
+          info!("send works again after {failed} failed attempts");
+        }
+        flow.next_ts = flow.next_ts.wrapping_add(flow.fpp.try_into().unwrap());
         iterations += 1;
         if (iterations % 16) == 0 {
           if let Some(real_now) = self.clock.wrapping_now_in_timebase(self.sample_rate as u64) {
@@ -469,11 +594,18 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
       }
       // ONS fork: a closed gate has nothing to wait for; the wait is the idle sleep, after which
       // `transmit` looks at the gate again. (Waiting for stale timestamps would spin.)
+      // ONS fork (#178): a flow in send backoff is not waited for by its (past) timestamp but by the end
+      // of the backoff, so the loop sleeps instead of spinning.
+      let loop_started = Instant::now();
       let min_next_ts = self
         .flows
         .iter()
         .filter_map(|opt| opt.as_ref())
-        .filter(|flow| self.gate_open && !flow.expired.load(Ordering::Relaxed))
+        .filter(|flow| {
+          self.gate_open
+            && !flow.expired.load(Ordering::Relaxed)
+            && !flow.send_backoff.blocked_at(loop_started)
+        })
         .map(|&ref flow| flow.next_ts as Clock)
         .min_by(|&a, &b| wrapped_diff(a, b).cmp(&0));
 
@@ -496,6 +628,10 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
         .and_then(|ts| self.clock.system_clock_duration_from_until(now as Clock, ts, sample_rate as u64))
         .unwrap_or(std::time::Duration::from_secs(20))
         .max(MIN_SLEEP);
+      let sleep_duration = match self.next_backoff_end(loop_started) {
+        Some(wait) => sleep_duration.min(wait),
+        None => sleep_duration,
+      };
 
       let command = if sleep_duration < SELECT_THRESHOLD {
         // on_transfer callback must be called to notify about transmission in previous iteration,
@@ -596,6 +732,7 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
             bytes_per_sample,
             expires: if needs_keepalives { Some(0) } else { None },
             expired,
+            send_backoff: SendBackoff::default(),
           };
           // ONS fork: the thread may just have woken from a long wait during which the media clock
           // stepped; start the flow on the current clock, not the one from before the wait.
@@ -1087,6 +1224,7 @@ mod tests {
       bytes_per_sample: 3,
       expires: if keepalives { Some(0) } else { None },
       expired: Arc::new(AtomicBool::new(false)),
+      send_backoff: SendBackoff::default(),
     };
     let now = t.now().unwrap();
     flow.bootstrap_next_ts(now);
@@ -1389,5 +1527,211 @@ mod tests {
       println!("  +{:.1} s {line}", at.duration_since(started).as_secs_f64());
     }
     println!("(packets still queued at the receivers at the end: {})", received_rx.recv().unwrap());
+  }
+
+  // ---- ONS fork (#178): backoff after failed sends ----
+
+  /// A flow whose every `send` fails: the socket is not connected, so there is no destination.
+  fn add_failing_flow(t: &mut Internal, index: usize) {
+    add_flow(t, index, false);
+    let flow = t.flows[index].as_mut().unwrap();
+    flow.socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    flow.socket.set_nonblocking(true).unwrap();
+    assert!(flow.socket.send(&[0u8; 16]).is_err());
+  }
+
+  fn failures(t: &Internal, index: usize) -> u64 {
+    t.flows[index].as_ref().unwrap().send_backoff.total_failures()
+  }
+
+  #[test]
+  fn the_backoff_doubles_up_to_the_cap_and_a_success_resets_it() {
+    let start = Instant::now();
+    let mut b = SendBackoff::default();
+    assert!(!b.blocked_at(start));
+    assert_eq!(b.success(), None);
+    let mut now = start;
+    let mut delays = vec![];
+    for _ in 0..10 {
+      b.failure(now);
+      delays.push(b.delay());
+      assert!(b.blocked_at(now));
+      assert_eq!(b.remaining_at(now), b.delay());
+      now += b.delay();
+      assert!(!b.blocked_at(now), "the backoff ends exactly after its delay");
+    }
+    let ms: Vec<u128> = delays.iter().map(|d| d.as_millis()).collect();
+    assert_eq!(ms, [1, 2, 4, 8, 16, 32, 64, 100, 100, 100]);
+    assert_eq!(b.consecutive_failures(), 10);
+    // The first success forgets it all.
+    assert_eq!(b.success(), Some(10));
+    assert_eq!(b.delay(), Duration::ZERO);
+    assert!(!b.blocked_at(now));
+    assert_eq!(b.consecutive_failures(), 0);
+    assert_eq!(b.total_failures(), 10);
+    // And the next failure starts from the bottom again.
+    b.failure(now);
+    assert_eq!(b.delay(), SEND_BACKOFF_MIN);
+  }
+
+  #[test]
+  fn a_send_that_always_fails_is_retried_a_bounded_number_of_times_per_second() {
+    // Virtual time: a loop that retries as soon as the backoff allows, for 10 s.
+    let start = Instant::now();
+    let mut b = SendBackoff::default();
+    let mut now = start;
+    let mut attempts = 0u64;
+    while now < start + Duration::from_secs(10) {
+      if b.blocked_at(now) {
+        now += b.remaining_at(now); // the loop sleeps until the end of the backoff
+        continue;
+      }
+      attempts += 1;
+      b.failure(now);
+    }
+    // 7 doublings in the first 127 ms, then one try per 100 ms. Upstream made ~110,000 per second.
+    assert!((95..=110).contains(&attempts), "{attempts} attempts in 10 s");
+    // Steady state: about 10 tries per second.
+    let mid = attempts;
+    let end = start + Duration::from_secs(11);
+    while now < end {
+      if b.blocked_at(now) {
+        now += b.remaining_at(now);
+        continue;
+      }
+      attempts += 1;
+      b.failure(now);
+    }
+    assert!((9..=11).contains(&(attempts - mid)), "{} attempts in the next second", attempts - mid);
+  }
+
+  #[test]
+  fn failure_logging_is_rate_limited_and_counts_what_it_left_out() {
+    let start = Instant::now();
+    let mut b = SendBackoff::default();
+    assert_eq!(b.failure(start), Some(0), "the first failure is logged");
+    assert_eq!(b.failure(start + 10 * MS), None);
+    assert_eq!(b.failure(start + 20 * MS), None);
+    assert_eq!(b.failure(start + 30 * MS), None);
+    assert_eq!(b.failure(start + SEND_ERROR_LOG_INTERVAL + MS), Some(3));
+    assert_eq!(b.failure(start + SEND_ERROR_LOG_INTERVAL + 2 * MS), None);
+    // After a recovery the next failure is logged at once.
+    b.success();
+    assert_eq!(b.failure(start + SEND_ERROR_LOG_INTERVAL + 3 * MS), Some(0));
+  }
+
+  #[test]
+  fn a_failed_send_stops_the_flow_instead_of_retrying_in_a_tight_loop() {
+    let mut t = internal(None);
+    add_failing_flow(&mut t, 0);
+    let mut rng = SmallRng::seed_from_u64(1);
+    // A caller that calls `transmit` as fast as it can for 300 ms (what the loop did, with no sleep
+    // between passes, when the NIC went away). The flow's timestamp is behind `now`, so without the
+    // backoff every call would try to send again, and the old code retried inside one call too.
+    let end = Instant::now() + Duration::from_millis(300);
+    let mut passes = 0u64;
+    while Instant::now() < end {
+      let now = t.now().unwrap();
+      t.transmit(&mut rng, now, false);
+      passes += 1;
+    }
+    let n = failures(&t, 0);
+    // 1+2+4+8+16+32+64 ms = 127 ms for 7 tries, then one per 100 ms: about 9 or 10 in 300 ms.
+    assert!((6..=14).contains(&n), "{n} failed sends in 300 ms ({passes} passes)");
+    assert!(passes > n * 10, "the test should have spun far faster than it sent ({passes} passes)");
+    assert!(t.flows[0].as_ref().unwrap().send_backoff.delay() > Duration::ZERO);
+  }
+
+  #[test]
+  fn the_flow_sends_again_on_the_first_success_after_the_backoff() {
+    let mut t = internal(None);
+    let rx = add_flow(&mut t, 0, false);
+    // Break the flow's socket, then put a working one back.
+    let good = std::mem::replace(
+      &mut t.flows[0].as_mut().unwrap().socket,
+      UdpSocket::bind("127.0.0.1:0").unwrap(),
+    );
+    let mut rng = SmallRng::seed_from_u64(1);
+    run_for(&mut t, Duration::from_millis(20));
+    assert!(failures(&t, 0) >= 1);
+    assert_eq!(packet_seconds(&rx), Vec::<u32>::new());
+    t.flows[0].as_mut().unwrap().socket = good;
+    // Held back until the backoff ends, then it transmits and the failure state is gone.
+    let before = failures(&t, 0);
+    let wait = t.flows[0].as_ref().unwrap().send_backoff.remaining_at(Instant::now());
+    std::thread::sleep(wait + 2 * MS);
+    let now = t.now().unwrap();
+    t.transmit(&mut rng, now, false);
+    let flow = t.flows[0].as_ref().unwrap();
+    assert_eq!(flow.send_backoff.consecutive_failures(), 0);
+    assert_eq!(flow.send_backoff.delay(), Duration::ZERO);
+    assert_eq!(flow.send_backoff.total_failures(), before);
+    assert!(!packet_seconds(&rx).is_empty(), "no packet after recovery");
+  }
+
+  #[test]
+  fn a_failing_flow_does_not_hold_back_the_others() {
+    let mut t = internal(None);
+    add_failing_flow(&mut t, 0);
+    let rx = add_flow(&mut t, 1, false);
+    run_for(&mut t, Duration::from_millis(60));
+    assert!(failures(&t, 0) >= 3);
+    assert_eq!(failures(&t, 1), 0);
+    assert!(packet_seconds(&rx).len() > 20, "the healthy flow was starved");
+  }
+
+  #[test]
+  fn the_wait_for_a_backoff_is_not_reported_as_a_stall() {
+    // The loop asks for the backoff as its sleep, so a normal wake of that sleep is not late.
+    let r = stall_report(
+      SEND_BACKOFF_MAX,
+      SEND_BACKOFF_MAX + 600 * US,
+      100 * US,
+      50 * US,
+      STALL_REPORT_THRESHOLD,
+    );
+    assert_eq!(r, None);
+    // And the sleep the loop asks for while a flow is backing off is the backoff, not zero.
+    let mut t = internal(None);
+    add_failing_flow(&mut t, 0);
+    assert_eq!(t.next_backoff_end(Instant::now()), None);
+    let failed_at = Instant::now();
+    t.flows[0].as_mut().unwrap().send_backoff.failure(failed_at);
+    assert_eq!(t.next_backoff_end(failed_at), Some(SEND_BACKOFF_MIN));
+    assert_eq!(t.next_backoff_end(failed_at + SEND_BACKOFF_MIN), None);
+  }
+
+  /// The real loop (own thread, real sleeps) with a flow whose sends always fail: it makes a handful of
+  /// attempts, not tens of thousands, and it still stops when asked.
+  #[test]
+  fn the_real_loop_backs_off_when_sends_fail() {
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<(u64, u64)>();
+    let thread = run_future_in_new_thread("tx backoff test", move || {
+      async move {
+        let mut t = internal(None);
+        let (_commands, queue) = mpsc::channel(8);
+        t.commands_receiver = queue;
+        add_failing_flow(&mut t, 0);
+        let rx = add_flow(&mut t, 1, false);
+        let stop = t.stop.clone();
+        std::thread::spawn(move || {
+          std::thread::sleep(Duration::from_millis(600));
+          stop.store(true, Ordering::Release);
+        });
+        t.run(None).await;
+        let mut buf = [0u8; 2048];
+        let mut packets = 0;
+        while rx.recv(&mut buf).is_ok() {
+          packets += 1;
+        }
+        result_tx.send((failures(&t, 0), packets)).unwrap();
+      }
+      .boxed_local()
+    });
+    thread.join().unwrap();
+    let (failed, healthy_packets) = result_rx.recv().unwrap();
+    // 7 tries in the first 127 ms, then one per 100 ms: about 12 in 600 ms. Allow for slow machines.
+    assert!((5..=30).contains(&failed), "{failed} failed sends in 600 ms");
+    assert!(healthy_packets > 100, "the healthy flow sent {healthy_packets} packets");
   }
 }
