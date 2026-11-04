@@ -721,6 +721,11 @@ pub async fn run_server(
               }
             }
             conn.respond(&[]).await;
+          } else {
+            // ONS fork: no receiver yet. Refuse instead of staying silent, so the controller is not left
+            // waiting for a reply that never comes.
+            warn!("subscription request refused: the receiver is not running");
+            conn.respond_with_code(CODE_REJECTED, &[]).await;
           }
         }
 
@@ -734,17 +739,22 @@ pub async fn run_server(
               Some(&[hi, lo]) => make_u16(hi, lo),
               _ => {
                 error!("disconnect request too short: {}", hex::encode(content));
+                conn.respond_with_code(CODE_REJECTED, &[]).await;
                 continue;
               }
             };
             let local_channel_index = usize::from(local_channel).wrapping_sub(1);
             if local_channel_index >= self_info.rx_channels.len() {
               error!("got disconnect request for nonexisting channel {local_channel}");
+              conn.respond_with_code(CODE_REJECTED, &[]).await;
               continue;
             }
             info!("disconnect requested: local channel {}", local_channel);
             channels_recv.unsubscribe(local_channel_index).await;
             conn.respond(&[]).await;
+          } else {
+            warn!("disconnect request refused: the receiver is not running");
+            conn.respond_with_code(CODE_REJECTED, &[]).await;
           }
         }
 
